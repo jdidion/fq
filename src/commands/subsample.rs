@@ -56,6 +56,7 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
             args.exact,
             args.sampling_threads,
             args.compression_threads,
+            args.in_memory,
         )?;
     } else if let Some(probability) = args.probability {
         if args.bin_by_tile {
@@ -67,6 +68,7 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
                 args.exact,
                 args.sampling_threads,
                 args.compression_threads,
+                args.in_memory,
             )?;
         } else {
             subsample_approximate((r1_src, r1_dst), r2, rng, probability)?;
@@ -81,6 +83,7 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
                 args.exact,
                 args.sampling_threads,
                 args.compression_threads,
+                args.in_memory,
             )?;
         } else if args.exact || is_gzipped(r1_src) {
             subsample_exact((r1_src, r1_dst), r2, rng, record_count)?;
@@ -642,6 +645,7 @@ fn subsample_by_tile<Rng>(
     exact: bool,
     sampling_threads: usize,
     compression_threads: usize,
+    in_memory: bool,
 ) -> Result<(), SubsampleError>
 where
     Rng: rand::Rng + Send,
@@ -654,6 +658,16 @@ where
         (Some(_), None) => return Err(SubsampleError::MissingDestination("r2-dst")),
         (None, Some(_)) => return Err(SubsampleError::MissingSource("r2-src")),
         _ => {}
+    }
+
+    if in_memory {
+        return subsample_by_tile_in_memory(
+            (r1_src, r1_dst),
+            (r2_src, r2_dst),
+            rng,
+            mode,
+            compression_threads,
+        );
     }
 
     // Create temp directory
@@ -807,6 +821,172 @@ where
             r2_combined.extend_from_slice(chunk);
         }
         write_output_data(&r2_combined, r2_dst.unwrap(), compression_threads)?;
+    }
+
+    let percentage = if total_records > 0 {
+        selected_records as f64 / total_records as f64 * 100.0
+    } else {
+        0.0
+    };
+    info!(
+        "sampled {}/{} ({:.1}%) records across {} tiles",
+        selected_records, total_records, percentage, retained_count
+    );
+
+    Ok(())
+}
+
+// ===== In-memory tile binning =====
+
+struct InMemoryTile {
+    r1_records: Vec<Vec<u8>>,
+    r2_records: Vec<Vec<u8>>,
+}
+
+fn subsample_by_tile_in_memory<Rng>(
+    (r1_src, r1_dst): (&Path, &Path),
+    (r2_src, r2_dst): (Option<&Path>, Option<&Path>),
+    mut rng: Rng,
+    mode: TileCountMode,
+    compression_threads: usize,
+) -> Result<(), SubsampleError>
+where
+    Rng: rand::Rng,
+{
+    info!("using in-memory tile binning");
+
+    let mut r1 = fastq::fs::open(r1_src).map_err(|e| SubsampleError::OpenFile(e, r1_src.into()))?;
+    let mut r1_rec = Record::default();
+
+    let mut r2_reader = r2_src
+        .map(|p| fastq::fs::open(p).map_err(|e| SubsampleError::OpenFile(e, p.into())))
+        .transpose()?;
+    let mut r2_rec = Record::default();
+
+    let paired = r2_src.is_some();
+    let mut tiles: HashMap<u64, InMemoryTile> = HashMap::new();
+    let mut parse_failures: u64 = 0;
+
+    // First pass: read all records into memory, binned by tile
+    loop {
+        let r1_len = r1.read_record(&mut r1_rec)?;
+        let r2_len = if let Some(r2) = r2_reader.as_mut() {
+            r2.read_record(&mut r2_rec)?
+        } else {
+            0
+        };
+
+        match (r1_len, r2_len, paired) {
+            (0, 0, _) | (0, _, false) => break,
+            (0, _, true) => return Err(SubsampleError::UnexpectedEof("r1-src")),
+            (_, 0, true) => return Err(SubsampleError::UnexpectedEof("r2-src")),
+            _ => {}
+        }
+
+        if let Some(bin_key) = parse_tile_bin(r1_rec.name()) {
+            let tile = tiles.entry(bin_key).or_insert_with(|| InMemoryTile {
+                r1_records: Vec::new(),
+                r2_records: Vec::new(),
+            });
+            tile.r1_records.push(r1_rec.as_ref().to_vec());
+            if paired {
+                tile.r2_records.push(r2_rec.as_ref().to_vec());
+            }
+        } else {
+            parse_failures += 1;
+        }
+    }
+
+    let total_records: usize = tiles.values().map(|t| t.r1_records.len()).sum();
+    let num_bins = tiles.len();
+
+    info!(
+        total_records,
+        parse_failures,
+        bins = num_bins,
+        "in-memory binning complete"
+    );
+
+    if parse_failures > 0 {
+        warn!(
+            "{} records had headers that could not be parsed as Illumina format",
+            parse_failures
+        );
+    }
+
+    // Compute per-tile target
+    let record_count_per_tile = match mode {
+        TileCountMode::Explicit(n) => n as usize,
+        TileCountMode::FromRecordCount(target) => {
+            if num_bins == 0 { 0 } else { target as usize / num_bins }
+        }
+        TileCountMode::FromProbability(p) => {
+            if num_bins == 0 {
+                0
+            } else {
+                (p * total_records as f64 / num_bins as f64).floor() as usize
+            }
+        }
+    };
+
+    info!(record_count_per_tile, "computed per-tile target");
+
+    if record_count_per_tile == 0 {
+        warn!("per-tile record count is 0; output will be empty");
+        write_output_data(&[], r1_dst, compression_threads)?;
+        if let Some(r2_dst) = r2_dst {
+            write_output_data(&[], r2_dst, compression_threads)?;
+        }
+        return Ok(());
+    }
+
+    // Sample from retained tiles
+    let mut r1_buf = Vec::new();
+    let mut r2_buf = Vec::new();
+    let mut retained_count = 0usize;
+
+    for tile in tiles.values() {
+        let count = tile.r1_records.len();
+        if count < record_count_per_tile {
+            continue;
+        }
+
+        retained_count += 1;
+
+        // Select random indices
+        let distribution = Uniform::new(0, count).map_err(SubsampleError::InvalidUniformRange)?;
+        let mut selected = vec![false; count];
+        let mut n = 0;
+        while n < record_count_per_tile {
+            let i = distribution.sample(&mut rng);
+            if !selected[i] {
+                selected[i] = true;
+                n += 1;
+            }
+        }
+
+        for (i, &sel) in selected.iter().enumerate() {
+            if sel {
+                r1_buf.extend_from_slice(&tile.r1_records[i]);
+                if paired {
+                    r2_buf.extend_from_slice(&tile.r2_records[i]);
+                }
+            }
+        }
+    }
+
+    let discarded_count = num_bins - retained_count;
+    info!(
+        retained_bins = retained_count,
+        discarded_bins = discarded_count,
+        "filtered bins"
+    );
+
+    let selected_records = r1_buf.iter().filter(|&&b| b == b'\n').count() / 4;
+
+    write_output_data(&r1_buf, r1_dst, compression_threads)?;
+    if paired {
+        write_output_data(&r2_buf, r2_dst.unwrap(), compression_threads)?;
     }
 
     let percentage = if total_records > 0 {
@@ -1459,6 +1639,7 @@ mod tests {
             true, // exact
             1,
             1,
+            false, // not in-memory
         )?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -1501,6 +1682,7 @@ mod tests {
             false, // skip-ahead
             1,
             1,
+            false,
         )?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -1555,6 +1737,7 @@ mod tests {
             true,
             1,
             1,
+            false,
         )?;
 
         let r1_output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -1604,11 +1787,69 @@ mod tests {
             true,
             1,
             1,
+            false,
         )?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
         let output_lines: Vec<&str> = output.trim().split('\n').collect();
         assert_eq!(output_lines.len(), 16, "expected 4 records (16 lines), got: {output}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn test_subsample_by_tile_in_memory() -> Result<(), SubsampleError> {
+        let dir = std::env::temp_dir().join("fq_test_tile_inmem");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let r1_data = b"\
+@A:1:FC:1:1101:10:20\nACGT\n+\nFFFF
+@A:1:FC:1:1101:30:40\nTGCA\n+\nFFFF
+@A:1:FC:1:1102:50:60\nGCTA\n+\nFFFF
+@A:1:FC:1:1101:70:80\nCGAT\n+\nFFFF
+";
+        let r2_data = b"\
+@A:1:FC:1:1101:10:20\nAAAA\n+\nFFFF
+@A:1:FC:1:1101:30:40\nCCCC\n+\nFFFF
+@A:1:FC:1:1102:50:60\nGGGG\n+\nFFFF
+@A:1:FC:1:1101:70:80\nTTTT\n+\nFFFF
+";
+
+        let r1_src = dir.join("r1.fq");
+        let r1_dst = dir.join("r1_out.fq");
+        let r2_src = dir.join("r2.fq");
+        let r2_dst = dir.join("r2_out.fq");
+
+        std::fs::write(&r1_src, r1_data).unwrap();
+        std::fs::write(&r2_src, r2_data).unwrap();
+
+        let rng = SmallRng::seed_from_u64(42);
+        subsample_by_tile(
+            (&r1_src, &r1_dst),
+            (Some(r2_src.as_path()), Some(r2_dst.as_path())),
+            rng,
+            TileCountMode::Explicit(2),
+            false, // exact doesn't matter for in-memory
+            1,
+            1,
+            true, // in-memory
+        )?;
+
+        let r1_output = std::fs::read_to_string(&r1_dst).unwrap();
+        let r2_output = std::fs::read_to_string(&r2_dst).unwrap();
+
+        let r1_lines: Vec<&str> = r1_output.trim().split('\n').collect();
+        let r2_lines: Vec<&str> = r2_output.trim().split('\n').collect();
+
+        // 2 records from tile 1101 (3 records, 2 selected), tile 1102 discarded (1 < 2)
+        assert_eq!(r1_lines.len(), 8, "expected 2 R1 records, got: {r1_output}");
+        assert_eq!(r2_lines.len(), 8, "expected 2 R2 records, got: {r2_output}");
+
+        // All R1 records from tile 1101
+        for line in r1_lines.iter().step_by(4) {
+            assert!(line.contains(":1101:"), "expected tile 1101, got: {line}");
+        }
 
         std::fs::remove_dir_all(&dir).unwrap();
         Ok(())
@@ -1631,7 +1872,7 @@ mod tests {
         std::fs::write(&r1_src, data).unwrap();
 
         let rng = SmallRng::seed_from_u64(42);
-        subsample_by_tile((&r1_src, &r1_dst), (None, None), rng, TileCountMode::Explicit(3), true, 1, 1)?;
+        subsample_by_tile((&r1_src, &r1_dst), (None, None), rng, TileCountMode::Explicit(3), true, 1, 1, false)?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
         assert!(output.is_empty(), "expected empty output, got: {output}");

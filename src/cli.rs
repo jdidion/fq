@@ -147,6 +147,11 @@ pub struct SubsampleArgs {
     #[arg(long)]
     pub exact: bool,
 
+    /// Keep tile bins in memory instead of writing to temporary files. Uses more memory but
+    /// avoids temporary disk I/O. Only used with tile binning.
+    #[arg(long)]
+    pub in_memory: bool,
+
     /// Number of threads for parallel tile sampling. Only used with tile binning.
     #[arg(long, default_value_t = 1)]
     pub sampling_threads: usize,
