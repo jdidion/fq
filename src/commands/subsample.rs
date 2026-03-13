@@ -53,10 +53,11 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
             r2,
             rng,
             TileCountMode::Explicit(record_count_per_tile),
-            args.exact,
+            args.fast,
             args.sampling_threads,
             args.compression_threads,
             args.in_memory,
+            args.temp_dir.as_deref(),
         )?;
     } else if let Some(probability) = args.probability {
         if args.bin_by_tile {
@@ -65,10 +66,11 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
                 r2,
                 rng,
                 TileCountMode::FromProbability(probability),
-                args.exact,
+                args.fast,
                 args.sampling_threads,
                 args.compression_threads,
                 args.in_memory,
+                args.temp_dir.as_deref(),
             )?;
         } else {
             subsample_approximate((r1_src, r1_dst), r2, rng, probability)?;
@@ -80,20 +82,16 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
                 r2,
                 rng,
                 TileCountMode::FromRecordCount(record_count),
-                args.exact,
+                args.fast,
                 args.sampling_threads,
                 args.compression_threads,
                 args.in_memory,
+                args.temp_dir.as_deref(),
             )?;
-        } else if args.exact || is_gzipped(r1_src) {
-            subsample_exact((r1_src, r1_dst), r2, rng, record_count)?;
+        } else if args.fast && !is_gzipped(r1_src) {
+            subsample_skip_ahead((r1_src, r1_dst), r2, rng, record_count)?;
         } else {
-            subsample_skip_ahead(
-                (r1_src, r1_dst),
-                r2,
-                rng,
-                record_count,
-            )?;
+            subsample_exact((r1_src, r1_dst), r2, rng, record_count)?;
         }
     } else {
         unreachable!();
@@ -642,10 +640,11 @@ fn subsample_by_tile<Rng>(
     (r2_src, r2_dst): (Option<&Path>, Option<&Path>),
     rng: Rng,
     mode: TileCountMode,
-    exact: bool,
+    fast: bool,
     sampling_threads: usize,
     compression_threads: usize,
     in_memory: bool,
+    temp_dir_path: Option<&Path>,
 ) -> Result<(), SubsampleError>
 where
     Rng: rand::Rng + Send,
@@ -671,7 +670,11 @@ where
     }
 
     // Create temp directory
-    let temp_dir = TempDir::new().map_err(SubsampleError::TempDir)?;
+    let temp_dir = if let Some(parent) = temp_dir_path {
+        TempDir::new_in(parent).map_err(SubsampleError::TempDir)?
+    } else {
+        TempDir::new().map_err(SubsampleError::TempDir)?
+    };
     info!(temp_dir = %temp_dir.path().display(), "created temp directory");
 
     // First pass: write per-tile temp files
@@ -746,7 +749,7 @@ where
 
     // Sample tiles in parallel
     info!(
-        exact,
+        fast,
         sampling_threads,
         "sampling {} tiles",
         retained_count
@@ -778,10 +781,10 @@ where
                             SmallRng::seed_from_u64(rng.random())
                         };
 
-                        let (r1_data, r2_data) = if exact {
-                            sample_tile_exact(tile, record_count_per_tile, &mut tile_rng)?
-                        } else {
+                        let (r1_data, r2_data) = if fast {
                             sample_tile_skip_ahead(tile, record_count_per_tile, &mut tile_rng)?
+                        } else {
+                            sample_tile_exact(tile, record_count_per_tile, &mut tile_rng)?
                         };
 
                         r1_results.lock().unwrap().push(r1_data);
@@ -1636,10 +1639,11 @@ mod tests {
             (None, None),
             rng,
             TileCountMode::Explicit(2),
-            true, // exact
+            false, // not fast (use exact)
             1,
             1,
             false, // not in-memory
+            None,  // default temp dir
         )?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -1679,10 +1683,11 @@ mod tests {
             (None, None),
             rng,
             TileCountMode::Explicit(5),
-            false, // skip-ahead
+            true, // fast (skip-ahead)
             1,
             1,
             false,
+            None,
         )?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -1734,10 +1739,11 @@ mod tests {
             (Some(r2_src.as_path()), Some(r2_dst.as_path())),
             rng,
             TileCountMode::Explicit(2),
-            true,
+            false, // not fast (use exact)
             1,
             1,
             false,
+            None,
         )?;
 
         let r1_output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -1784,10 +1790,11 @@ mod tests {
             (None, None),
             rng,
             TileCountMode::FromRecordCount(4),
-            true,
+            false, // not fast (use exact)
             1,
             1,
             false,
+            None,
         )?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -1830,10 +1837,11 @@ mod tests {
             (Some(r2_src.as_path()), Some(r2_dst.as_path())),
             rng,
             TileCountMode::Explicit(2),
-            false, // exact doesn't matter for in-memory
+            false, // not fast; doesn't matter for in-memory
             1,
             1,
             true, // in-memory
+            None,
         )?;
 
         let r1_output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -1872,7 +1880,7 @@ mod tests {
         std::fs::write(&r1_src, data).unwrap();
 
         let rng = SmallRng::seed_from_u64(42);
-        subsample_by_tile((&r1_src, &r1_dst), (None, None), rng, TileCountMode::Explicit(3), true, 1, 1, false)?;
+        subsample_by_tile((&r1_src, &r1_dst), (None, None), rng, TileCountMode::Explicit(3), false, 1, 1, false, None)?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
         assert!(output.is_empty(), "expected empty output, got: {output}");

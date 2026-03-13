@@ -142,15 +142,21 @@ pub struct SubsampleArgs {
     #[arg(long)]
     pub bin_by_tile: bool,
 
-    /// Use exact two-pass sampling instead of the default skip-ahead method. Skip-ahead is
-    /// faster but produces approximately (not exactly) the requested number of records.
+    /// Use faster skip-ahead sampling instead of the default exact method. Skip-ahead uses
+    /// exponential byte jumps and produces approximately (not exactly) the requested number
+    /// of records, but avoids reading the entire file.
     #[arg(long)]
-    pub exact: bool,
+    pub fast: bool,
 
     /// Keep tile bins in memory instead of writing to temporary files. Uses more memory but
     /// avoids temporary disk I/O. Only used with tile binning.
     #[arg(long)]
     pub in_memory: bool,
+
+    /// Directory for temporary tile files. Defaults to the system temp directory. Only used
+    /// with tile binning when --in-memory is not set.
+    #[arg(long)]
+    pub temp_dir: Option<PathBuf>,
 
     /// Number of threads for parallel tile sampling. Only used with tile binning.
     #[arg(long, default_value_t = 1)]
