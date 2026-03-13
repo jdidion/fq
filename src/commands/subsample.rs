@@ -41,27 +41,37 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
         SmallRng::from_os_rng()
     };
 
-    if let Some(probability) = args.probability {
-        subsample_approximate(
-            (r1_src, r1_dst),
-            (r2_src.map(|p| &**p), r2_dst.map(|p| &**p)),
-            rng,
-            probability,
-        )?;
-    } else if let Some(record_count) = args.record_count {
-        subsample_exact(
-            (r1_src, r1_dst),
-            (r2_src.map(|p| &**p), r2_dst.map(|p| &**p)),
-            rng,
-            record_count,
-        )?;
-    } else if let Some(record_count_per_tile) = args.record_count_per_tile {
+    let r2 = (r2_src.map(|p| &**p), r2_dst.map(|p| &**p));
+
+    if let Some(record_count_per_tile) = args.record_count_per_tile {
         subsample_by_tile(
             (r1_src, r1_dst),
-            (r2_src.map(|p| &**p), r2_dst.map(|p| &**p)),
+            r2,
             rng,
-            record_count_per_tile,
+            TileCountMode::Explicit(record_count_per_tile),
         )?;
+    } else if let Some(probability) = args.probability {
+        if args.bin_by_tile {
+            subsample_by_tile(
+                (r1_src, r1_dst),
+                r2,
+                rng,
+                TileCountMode::FromProbability(probability),
+            )?;
+        } else {
+            subsample_approximate((r1_src, r1_dst), r2, rng, probability)?;
+        }
+    } else if let Some(record_count) = args.record_count {
+        if args.bin_by_tile {
+            subsample_by_tile(
+                (r1_src, r1_dst),
+                r2,
+                rng,
+                TileCountMode::FromRecordCount(record_count),
+            )?;
+        } else {
+            subsample_exact((r1_src, r1_dst), r2, rng, record_count)?;
+        }
     } else {
         unreachable!();
     }
@@ -387,6 +397,12 @@ where
     Ok(())
 }
 
+enum TileCountMode {
+    Explicit(u64),
+    FromRecordCount(u64),
+    FromProbability(f64),
+}
+
 /// Parses an Illumina read header to extract (lane, tile) as a packed u64 key.
 ///
 /// Expected format: `@<instrument>:<run>:<flowcell>:<lane>:<tile>:<x>:<y>`
@@ -435,12 +451,12 @@ fn subsample_by_tile<Rng>(
     (r1_src, r1_dst): (&Path, &Path),
     (r2_src, r2_dst): (Option<&Path>, Option<&Path>),
     mut rng: Rng,
-    record_count_per_tile: u64,
+    mode: TileCountMode,
 ) -> Result<(), SubsampleError>
 where
     Rng: rand::Rng,
 {
-    let span = info_span!("subsample_by_tile", record_count_per_tile);
+    let span = info_span!("subsample_by_tile");
     let _span_ctx = span.enter();
 
     // First pass: read R1 to bin records by (lane, tile)
@@ -464,10 +480,11 @@ where
     }
 
     let total_records = bin_assignments.len();
+    let num_bins = bin_counts.len();
     info!(
         total_records,
         parse_failures,
-        bins = bin_counts.len(),
+        bins = num_bins,
         "binning complete"
     );
 
@@ -476,6 +493,31 @@ where
             "{} records had headers that could not be parsed as Illumina format",
             parse_failures
         );
+    }
+
+    // Compute per-tile count based on mode
+    let record_count_per_tile = match mode {
+        TileCountMode::Explicit(n) => n,
+        TileCountMode::FromRecordCount(target) => {
+            if num_bins == 0 {
+                0
+            } else {
+                target / num_bins as u64
+            }
+        }
+        TileCountMode::FromProbability(p) => {
+            if num_bins == 0 {
+                0
+            } else {
+                (p * total_records as f64 / num_bins as f64).floor() as u64
+            }
+        }
+    };
+
+    info!(record_count_per_tile, "computed per-tile target");
+
+    if record_count_per_tile == 0 {
+        warn!("per-tile record count is 0; output will be empty");
     }
 
     // For each retained bin, randomly select record_count_per_tile positions
@@ -765,7 +807,7 @@ mod tests {
             (&r1_src, &r1_dst),
             (None, None),
             rng,
-            2,
+            TileCountMode::Explicit(2),
         )?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -820,7 +862,7 @@ mod tests {
             (&r1_src, &r1_dst),
             (Some(r2_src.as_path()), Some(r2_dst.as_path())),
             rng,
-            2,
+            TileCountMode::Explicit(2),
         )?;
 
         let r1_output = std::fs::read_to_string(&r1_dst).unwrap();
@@ -839,6 +881,92 @@ mod tests {
             let r2_name = r2_lines[i].split(' ').next().unwrap();
             assert_eq!(r1_name, r2_name);
         }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_subsample_by_tile_from_record_count() -> Result<(), SubsampleError> {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("fq_test_tile_from_count");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 6 records across 2 tiles (3 each). Target 4 total → 4/2=2 per tile.
+        let data = b"\
+@A:1:FC:1:1101:10:20\nACGT\n+\nFFFF
+@A:1:FC:1:1102:10:20\nTGCA\n+\nFFFF
+@A:1:FC:1:1101:30:40\nGCTA\n+\nFFFF
+@A:1:FC:1:1102:30:40\nCGAT\n+\nFFFF
+@A:1:FC:1:1101:50:60\nACGT\n+\nFFFF
+@A:1:FC:1:1102:50:60\nTGCA\n+\nFFFF
+";
+
+        let r1_src = dir.join("r1.fq");
+        let r1_dst = dir.join("r1_out.fq");
+
+        {
+            let mut f = File::create(&r1_src).unwrap();
+            f.write_all(data).unwrap();
+        }
+
+        let rng = SmallRng::seed_from_u64(42);
+        subsample_by_tile(
+            (&r1_src, &r1_dst),
+            (None, None),
+            rng,
+            TileCountMode::FromRecordCount(4),
+        )?;
+
+        let output = std::fs::read_to_string(&r1_dst).unwrap();
+        let output_lines: Vec<&str> = output.trim().split('\n').collect();
+        // 2 per tile * 2 tiles = 4 records = 16 lines
+        assert_eq!(output_lines.len(), 16, "expected 4 records (16 lines), got: {output}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_subsample_by_tile_from_probability() -> Result<(), SubsampleError> {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("fq_test_tile_from_prob");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 6 records across 2 tiles (3 each). Probability 0.5 → floor(0.5 * 6 / 2) = 1 per tile.
+        let data = b"\
+@A:1:FC:1:1101:10:20\nACGT\n+\nFFFF
+@A:1:FC:1:1102:10:20\nTGCA\n+\nFFFF
+@A:1:FC:1:1101:30:40\nGCTA\n+\nFFFF
+@A:1:FC:1:1102:30:40\nCGAT\n+\nFFFF
+@A:1:FC:1:1101:50:60\nACGT\n+\nFFFF
+@A:1:FC:1:1102:50:60\nTGCA\n+\nFFFF
+";
+
+        let r1_src = dir.join("r1.fq");
+        let r1_dst = dir.join("r1_out.fq");
+
+        {
+            let mut f = File::create(&r1_src).unwrap();
+            f.write_all(data).unwrap();
+        }
+
+        let rng = SmallRng::seed_from_u64(42);
+        subsample_by_tile(
+            (&r1_src, &r1_dst),
+            (None, None),
+            rng,
+            TileCountMode::FromProbability(0.5),
+        )?;
+
+        let output = std::fs::read_to_string(&r1_dst).unwrap();
+        let output_lines: Vec<&str> = output.trim().split('\n').collect();
+        // floor(0.5 * 6 / 2) = 1 per tile * 2 tiles = 2 records = 8 lines
+        assert_eq!(output_lines.len(), 8, "expected 2 records (8 lines), got: {output}");
 
         std::fs::remove_dir_all(&dir).unwrap();
 
@@ -869,7 +997,7 @@ mod tests {
         }
 
         let rng = SmallRng::seed_from_u64(42);
-        subsample_by_tile((&r1_src, &r1_dst), (None, None), rng, 3)?;
+        subsample_by_tile((&r1_src, &r1_dst), (None, None), rng, TileCountMode::Explicit(3))?;
 
         let output = std::fs::read_to_string(&r1_dst).unwrap();
         assert!(output.is_empty(), "expected empty output, got: {output}");

@@ -118,12 +118,14 @@ pub struct LintArgs {
 ))]
 pub struct SubsampleArgs {
     /// The probability a record is kept, as a percentage (0.0, 1.0). Cannot be used with
-    /// `record-count` or `record-count-per-tile`.
+    /// `record-count` or `record-count-per-tile`. When combined with `--bin-by-tile`, the
+    /// per-tile count is computed as floor(probability * total_records / num_bins).
     #[arg(short, long)]
     pub probability: Option<f64>,
 
     /// The exact number of records to keep. Cannot be used with `probability` or
-    /// `record-count-per-tile`.
+    /// `record-count-per-tile`. When combined with `--bin-by-tile`, the per-tile count is
+    /// computed as record_count / num_bins.
     #[arg(short = 'n', long)]
     pub record_count: Option<u64>,
 
@@ -133,6 +135,12 @@ pub struct SubsampleArgs {
     /// Cannot be used with `probability` or `record-count`.
     #[arg(long)]
     pub record_count_per_tile: Option<u64>,
+
+    /// Enable per-tile binning. Reads are binned by lane and tile from the Illumina read
+    /// header. Can be combined with `--record-count` or `--probability` to automatically
+    /// compute the per-tile count, or use `--record-count-per-tile` to set it explicitly.
+    #[arg(long)]
+    pub bin_by_tile: bool,
 
     /// Seed to use for the random number generator.
     #[arg(short, long)]
