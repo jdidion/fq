@@ -142,6 +142,19 @@ pub struct SubsampleArgs {
     #[arg(long)]
     pub bin_by_tile: bool,
 
+    /// Use exact two-pass sampling instead of the default skip-ahead method. Skip-ahead is
+    /// faster but produces approximately (not exactly) the requested number of records.
+    #[arg(long)]
+    pub exact: bool,
+
+    /// Number of threads for parallel tile sampling. Only used with tile binning.
+    #[arg(long, default_value_t = 1)]
+    pub sampling_threads: usize,
+
+    /// Number of threads for output compression. Only used when output is gzipped.
+    #[arg(long, default_value_t = 1)]
+    pub compression_threads: usize,
+
     /// Seed to use for the random number generator.
     #[arg(short, long)]
     pub seed: Option<u64>,
