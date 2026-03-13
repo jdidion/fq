@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cargo test 2>&1\",\"timeout\":120000,\"description\":\"Build and run all tests\"}",
-  "error": "Exit code 101\n   Compiling fq v0.12.0 (/Users/jodidion/projects/fq)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.53s\n     Running unittests src/lib.rs (target/debug/deps/fq-54fb9c3f982d9677)\n\nrunning 72 tests\ntest collections::bloom_filter::bloom_filter::tests::test_optimal_required_bits ... ok\ntest collections::bloom_filter::bloom_filter::tests::test_optimal_number_of_hash_functions ... ok\ntest commands::filter::tests::test_name_id ... ok\ntest collections::bloom_filter::...",
-  "timestamp": "2026-03-13T20:38:15.799Z",
-  "retry_count": 1
-}
