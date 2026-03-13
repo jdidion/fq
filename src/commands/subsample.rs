@@ -198,10 +198,15 @@ where
 
     info!("counting records");
 
-    let line_count = count_lines(r1_src)?;
-    let actual_record_count = line_count / 4;
-
-    info!(actual_record_count = actual_record_count, "counted records");
+    let actual_record_count = if let Some(count) = count_records_from_index(r1_src)? {
+        info!(actual_record_count = count, "counted records from index");
+        count
+    } else {
+        let line_count = count_lines(r1_src)?;
+        let count = line_count / 4;
+        info!(actual_record_count = count, "counted records");
+        count
+    };
 
     let n = u64::try_from(actual_record_count)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -274,6 +279,51 @@ where
     }
 
     Ok(n)
+}
+
+/// Attempt to count records using a `.fai` index file.
+///
+/// Looks for `<src>.fai` (e.g., `reads.fq.fai` or `reads.fq.gz.fai`).
+/// The samtools FASTQ index format has one line per record, so the number
+/// of lines in the index equals the record count.
+///
+/// Returns `Ok(Some(count))` if an index was found and read successfully,
+/// `Ok(None)` if no index exists, or an error if the index exists but
+/// cannot be read.
+fn count_records_from_index<P>(src: P) -> io::Result<Option<usize>>
+where
+    P: AsRef<Path>,
+{
+    let mut index_path = src.as_ref().as_os_str().to_owned();
+    index_path.push(".fai");
+    let index_path = PathBuf::from(index_path);
+
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    info!(index = %index_path.display(), "found FASTQ index");
+
+    const LINE_FEED: u8 = b'\n';
+
+    let file = File::open(&index_path)?;
+    let mut reader = BufReader::new(file);
+    let mut n = 0;
+
+    loop {
+        let buf = reader.fill_buf()?;
+
+        if buf.is_empty() {
+            break;
+        }
+
+        n += bytecount::count(buf, LINE_FEED);
+
+        let len = buf.len();
+        reader.consume(len);
+    }
+
+    Ok(Some(n))
 }
 
 fn open<P>(src: P) -> io::Result<Box<dyn BufRead>>
@@ -506,6 +556,67 @@ mod tests {
         let w2_expected = b"@r1\nTGCA\n+\nBLQF\n@r2\nTGCA\n+\nBLQF\n";
         assert_eq!(w2.get_ref(), w2_expected);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_records_from_index_found() -> io::Result<()> {
+        let dir = std::env::temp_dir().join("fq_test_index_count");
+        std::fs::create_dir_all(&dir)?;
+
+        let fq_path = dir.join("test.fq");
+        let fai_path = dir.join("test.fq.fai");
+
+        // Write a dummy FASTQ file (4 records)
+        std::fs::write(
+            &fq_path,
+            b"@r1\nACGT\n+\nFFFF\n@r2\nTGCA\n+\nFFFF\n@r3\nGGGG\n+\nFFFF\n@r4\nCCCC\n+\nFFFF\n",
+        )?;
+
+        // Write a matching .fai index (4 lines = 4 records)
+        std::fs::write(
+            &fai_path,
+            b"r1\t4\t4\t4\t5\t14\nr2\t4\t24\t4\t5\t34\nr3\t4\t44\t4\t5\t54\nr4\t4\t64\t4\t5\t74\n",
+        )?;
+
+        let result = count_records_from_index(&fq_path)?;
+        assert_eq!(result, Some(4));
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_records_from_index_missing() -> io::Result<()> {
+        let dir = std::env::temp_dir().join("fq_test_index_missing");
+        std::fs::create_dir_all(&dir)?;
+
+        let fq_path = dir.join("test.fq");
+        std::fs::write(&fq_path, b"@r1\nACGT\n+\nFFFF\n")?;
+
+        let result = count_records_from_index(&fq_path)?;
+        assert_eq!(result, None);
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_records_from_index_gz() -> io::Result<()> {
+        let dir = std::env::temp_dir().join("fq_test_index_gz");
+        std::fs::create_dir_all(&dir)?;
+
+        let fq_path = dir.join("test.fq.gz");
+        let fai_path = dir.join("test.fq.gz.fai");
+
+        std::fs::write(&fq_path, b"dummy")?;
+        // 3-line index = 3 records
+        std::fs::write(&fai_path, b"r1\t4\t4\t4\t5\t14\nr2\t4\t24\t4\t5\t34\nr3\t4\t44\t4\t5\t54\n")?;
+
+        let result = count_records_from_index(&fq_path)?;
+        assert_eq!(result, Some(3));
+
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 }
