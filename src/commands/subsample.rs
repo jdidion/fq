@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, BufRead, BufReader, Write},
     ops::{Bound, RangeBounds},
@@ -53,6 +54,13 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
             (r2_src.map(|p| &**p), r2_dst.map(|p| &**p)),
             rng,
             record_count,
+        )?;
+    } else if let Some(record_count_per_tile) = args.record_count_per_tile {
+        subsample_by_tile(
+            (r1_src, r1_dst),
+            (r2_src.map(|p| &**p), r2_dst.map(|p| &**p)),
+            rng,
+            record_count_per_tile,
         )?;
     } else {
         unreachable!();
@@ -379,6 +387,183 @@ where
     Ok(())
 }
 
+/// Parses an Illumina read header to extract (lane, tile) as a packed u64 key.
+///
+/// Expected format: `@<instrument>:<run>:<flowcell>:<lane>:<tile>:<x>:<y>`
+fn parse_tile_bin(name: &[u8]) -> Option<u64> {
+    let name = if name.first() == Some(&b'@') {
+        &name[1..]
+    } else {
+        name
+    };
+
+    // Strip description (everything after first space)
+    let name = name.split(|&b| b == b' ').next()?;
+
+    let mut parts = name.split(|&b| b == b':');
+
+    // Skip instrument, run, flowcell (fields 0-2)
+    parts.next()?;
+    parts.next()?;
+    parts.next()?;
+
+    let lane_bytes = parts.next()?;
+    let tile_bytes = parts.next()?;
+
+    let lane: u32 = std::str::from_utf8(lane_bytes).ok()?.parse().ok()?;
+    let tile: u32 = std::str::from_utf8(tile_bytes).ok()?.parse().ok()?;
+
+    Some((lane as u64) << 32 | (tile as u64))
+}
+
+fn random_sample<Rng>(rng: &mut Rng, population: usize, n: usize) -> HashSet<usize>
+where
+    Rng: rand::Rng,
+{
+    let distribution = Uniform::new(0, population).unwrap();
+    let mut selected = HashSet::with_capacity(n);
+
+    while selected.len() < n {
+        let i = distribution.sample(rng);
+        selected.insert(i);
+    }
+
+    selected
+}
+
+fn subsample_by_tile<Rng>(
+    (r1_src, r1_dst): (&Path, &Path),
+    (r2_src, r2_dst): (Option<&Path>, Option<&Path>),
+    mut rng: Rng,
+    record_count_per_tile: u64,
+) -> Result<(), SubsampleError>
+where
+    Rng: rand::Rng,
+{
+    let span = info_span!("subsample_by_tile", record_count_per_tile);
+    let _span_ctx = span.enter();
+
+    // First pass: read R1 to bin records by (lane, tile)
+    info!("first pass: binning records by tile");
+
+    let mut r1 = fastq::fs::open(r1_src).map_err(|e| SubsampleError::OpenFile(e, r1_src.into()))?;
+    let mut record = Record::default();
+
+    let mut bin_assignments: Vec<u64> = Vec::new();
+    let mut bin_counts: HashMap<u64, usize> = HashMap::new();
+    let mut parse_failures: u64 = 0;
+
+    while r1.read_record(&mut record)? != 0 {
+        if let Some(bin_key) = parse_tile_bin(record.name()) {
+            bin_assignments.push(bin_key);
+            *bin_counts.entry(bin_key).or_insert(0) += 1;
+        } else {
+            bin_assignments.push(u64::MAX); // sentinel for unparseable
+            parse_failures += 1;
+        }
+    }
+
+    let total_records = bin_assignments.len();
+    info!(
+        total_records,
+        parse_failures,
+        bins = bin_counts.len(),
+        "binning complete"
+    );
+
+    if parse_failures > 0 {
+        warn!(
+            "{} records had headers that could not be parsed as Illumina format",
+            parse_failures
+        );
+    }
+
+    // For each retained bin, randomly select record_count_per_tile positions
+    let n = record_count_per_tile as usize;
+    let mut retained_bins: HashMap<u64, HashSet<usize>> = HashMap::new();
+
+    for (&bin_key, &count) in &bin_counts {
+        if count >= n {
+            let sample = random_sample(&mut rng, count, n);
+            retained_bins.insert(bin_key, sample);
+        }
+    }
+
+    let retained_bin_count = retained_bins.len();
+    let discarded_bin_count = bin_counts.len() - retained_bin_count;
+    info!(
+        retained_bins = retained_bin_count,
+        discarded_bins = discarded_bin_count,
+        "filtered bins"
+    );
+
+    if retained_bin_count == 0 {
+        warn!("no bins have enough records; output will be empty");
+    }
+
+    // Build global bitmap
+    info!("building selection bitmap");
+    let mut bitmap = BitVec::new();
+    bitmap.resize(total_records, false);
+
+    let mut bin_positions: HashMap<u64, usize> = HashMap::new();
+
+    for (i, &bin_key) in bin_assignments.iter().enumerate() {
+        if let Some(selected) = retained_bins.get(&bin_key) {
+            let pos = bin_positions.entry(bin_key).or_insert(0);
+            if selected.contains(pos) {
+                bitmap.set(i, true);
+            }
+            *pos += 1;
+        }
+    }
+
+    drop(bin_assignments);
+    drop(retained_bins);
+    drop(bin_positions);
+
+    let selected_count = bitmap.count_ones();
+    info!(selected_records = selected_count, "built selection bitmap");
+
+    // Second pass: write selected records
+    info!("second pass: writing selected records");
+
+    let mut r1 = fastq::fs::open(r1_src).map_err(|e| SubsampleError::OpenFile(e, r1_src.into()))?;
+    let mut w1 =
+        fastq::fs::create(r1_dst).map_err(|e| SubsampleError::CreateFile(e, r1_dst.into()))?;
+
+    match (r2_src, r2_dst) {
+        (Some(r2_src), Some(r2_dst)) => {
+            info!("sampling paired end reads");
+
+            let mut r2 =
+                fastq::fs::open(r2_src).map_err(|e| SubsampleError::OpenFile(e, r2_src.into()))?;
+            let mut w2 = fastq::fs::create(r2_dst)
+                .map_err(|e| SubsampleError::CreateFile(e, r2_dst.into()))?;
+
+            subsample_exact_paired((&mut r1, &mut w1), (&mut r2, &mut w2), &bitmap)?;
+        }
+        (Some(_), None) => return Err(SubsampleError::MissingDestination("r2-dst")),
+        (None, Some(_)) => return Err(SubsampleError::MissingSource("r2-src")),
+        (None, None) => {
+            info!("sampling single end reads");
+            subsample_exact_single(&mut r1, &mut w1, &bitmap)?;
+        }
+    }
+
+    let percentage = if total_records > 0 {
+        (selected_count as f64) / (total_records as f64) * 100.0
+    } else {
+        0.0
+    };
+    info!(
+        "sampled {}/{} ({:.1}%) records across {} tiles",
+        selected_count, total_records, percentage, retained_bin_count
+    );
+
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum SubsampleError {
     #[error("I/O error")]
@@ -505,6 +690,191 @@ mod tests {
 
         let w2_expected = b"@r1\nTGCA\n+\nBLQF\n@r2\nTGCA\n+\nBLQF\n";
         assert_eq!(w2.get_ref(), w2_expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_tile_bin() {
+        // Standard Illumina format
+        let key = parse_tile_bin(b"@A00226:83:HFWFVDSXX:2:1101:1234:5678");
+        assert_eq!(key, Some((2u64 << 32) | 1101));
+
+        // With description
+        let key = parse_tile_bin(b"@A00226:83:HFWFVDSXX:1:2205:9876:4321 1:N:0:ACGTACGT");
+        assert_eq!(key, Some((1u64 << 32) | 2205));
+
+        // Different lane/tile values
+        let key = parse_tile_bin(b"@INST:100:FC:4:2301:10:20");
+        assert_eq!(key, Some((4u64 << 32) | 2301));
+
+        // Too few fields
+        assert_eq!(parse_tile_bin(b"@INST:100:FC"), None);
+
+        // Non-numeric lane
+        assert_eq!(parse_tile_bin(b"@INST:100:FC:X:1101:1:2"), None);
+
+        // Non-numeric tile
+        assert_eq!(parse_tile_bin(b"@INST:100:FC:1:ABC:1:2"), None);
+
+        // No @ prefix still works
+        let key = parse_tile_bin(b"INST:100:FC:3:1201:1:2");
+        assert_eq!(key, Some((3u64 << 32) | 1201));
+    }
+
+    #[test]
+    fn test_random_sample() {
+        let mut rng = SmallRng::seed_from_u64(42);
+
+        let sample = random_sample(&mut rng, 100, 10);
+        assert_eq!(sample.len(), 10);
+        assert!(sample.iter().all(|&i| i < 100));
+
+        // All elements unique
+        let as_vec: Vec<_> = sample.iter().collect();
+        let as_set: HashSet<_> = as_vec.iter().collect();
+        assert_eq!(as_vec.len(), as_set.len());
+    }
+
+    #[test]
+    fn test_subsample_by_tile_single() -> Result<(), SubsampleError> {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("fq_test_tile_single");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 4 records: 3 on tile 1101, 1 on tile 1102. With n=2, tile 1101 is retained,
+        // tile 1102 is discarded. 2 of the 3 records from tile 1101 are selected.
+        let r1_data = b"\
+@A:1:FC:1:1101:10:20\nACGT\n+\nFFFF
+@A:1:FC:1:1101:30:40\nTGCA\n+\nFFFF
+@A:1:FC:1:1102:50:60\nGCTA\n+\nFFFF
+@A:1:FC:1:1101:70:80\nCGAT\n+\nFFFF
+";
+
+        let r1_src = dir.join("r1.fq");
+        let r1_dst = dir.join("r1_out.fq");
+
+        {
+            let mut f = File::create(&r1_src).unwrap();
+            f.write_all(r1_data).unwrap();
+        }
+
+        let rng = SmallRng::seed_from_u64(42);
+        subsample_by_tile(
+            (&r1_src, &r1_dst),
+            (None, None),
+            rng,
+            2,
+        )?;
+
+        let output = std::fs::read_to_string(&r1_dst).unwrap();
+        let output_records: Vec<&str> = output.trim().split('\n').collect();
+        // 2 records selected = 8 lines (4 lines per FASTQ record)
+        assert_eq!(output_records.len(), 8, "expected 2 records (8 lines), got: {output}");
+
+        // All selected records should be from tile 1101
+        for line in output_records.iter().step_by(4) {
+            assert!(line.contains(":1101:"), "expected tile 1101, got: {line}");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_subsample_by_tile_paired() -> Result<(), SubsampleError> {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("fq_test_tile_paired");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let r1_data = b"\
+@A:1:FC:1:1101:10:20\nACGT\n+\nFFFF
+@A:1:FC:1:1101:30:40\nTGCA\n+\nFFFF
+@A:1:FC:1:1102:50:60\nGCTA\n+\nFFFF
+@A:1:FC:1:1101:70:80\nCGAT\n+\nFFFF
+";
+        let r2_data = b"\
+@A:1:FC:1:1101:10:20\nAAAA\n+\nFFFF
+@A:1:FC:1:1101:30:40\nCCCC\n+\nFFFF
+@A:1:FC:1:1102:50:60\nGGGG\n+\nFFFF
+@A:1:FC:1:1101:70:80\nTTTT\n+\nFFFF
+";
+
+        let r1_src = dir.join("r1.fq");
+        let r1_dst = dir.join("r1_out.fq");
+        let r2_src = dir.join("r2.fq");
+        let r2_dst = dir.join("r2_out.fq");
+
+        {
+            let mut f = File::create(&r1_src).unwrap();
+            f.write_all(r1_data).unwrap();
+            let mut f = File::create(&r2_src).unwrap();
+            f.write_all(r2_data).unwrap();
+        }
+
+        let rng = SmallRng::seed_from_u64(42);
+        subsample_by_tile(
+            (&r1_src, &r1_dst),
+            (Some(r2_src.as_path()), Some(r2_dst.as_path())),
+            rng,
+            2,
+        )?;
+
+        let r1_output = std::fs::read_to_string(&r1_dst).unwrap();
+        let r2_output = std::fs::read_to_string(&r2_dst).unwrap();
+
+        let r1_lines: Vec<&str> = r1_output.trim().split('\n').collect();
+        let r2_lines: Vec<&str> = r2_output.trim().split('\n').collect();
+
+        // Both should have same number of records
+        assert_eq!(r1_lines.len(), 8);
+        assert_eq!(r2_lines.len(), 8);
+
+        // R1 and R2 names should match
+        for i in (0..r1_lines.len()).step_by(4) {
+            let r1_name = r1_lines[i].split(' ').next().unwrap();
+            let r2_name = r2_lines[i].split(' ').next().unwrap();
+            assert_eq!(r1_name, r2_name);
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_subsample_by_tile_all_bins_too_small() -> Result<(), SubsampleError> {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("fq_test_tile_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Only 2 records per tile, require 3
+        let data = b"\
+@A:1:FC:1:1101:10:20\nACGT\n+\nFFFF
+@A:1:FC:1:1101:30:40\nTGCA\n+\nFFFF
+@A:1:FC:1:1102:50:60\nGCTA\n+\nFFFF
+@A:1:FC:1:1102:70:80\nCGAT\n+\nFFFF
+";
+
+        let r1_src = dir.join("r1.fq");
+        let r1_dst = dir.join("r1_out.fq");
+
+        {
+            let mut f = File::create(&r1_src).unwrap();
+            f.write_all(data).unwrap();
+        }
+
+        let rng = SmallRng::seed_from_u64(42);
+        subsample_by_tile((&r1_src, &r1_dst), (None, None), rng, 3)?;
+
+        let output = std::fs::read_to_string(&r1_dst).unwrap();
+        assert!(output.is_empty(), "expected empty output, got: {output}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
 
         Ok(())
     }
