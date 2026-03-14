@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, BufWriter, Write},
     ops::{Bound, RangeBounds},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -20,7 +20,7 @@ use tracing::{info, info_span, warn};
 
 use crate::{
     cli::SubsampleArgs,
-    fastq::{self, Record},
+    fastq::{self, Record, io::{IndexedReader, RecordIndex}},
 };
 
 const VALID_PROBABILITY_RANGE: (Bound<f64>, Bound<f64>) =
@@ -223,32 +223,31 @@ where
 
     info!("counting records");
 
-    let actual_record_count = if let Some(index_count) = count_records_from_index(r1_src)? {
+    let actual_record_count = if let Some(fai_count) = RecordIndex::from_fai(r1_src)? {
         if is_gzipped(r1_src) {
-            // For gzipped input, trust the index (decompressing to cross-check
-            // would negate the performance benefit of having an index).
-            info!(actual_record_count = index_count, "counted records from index (gzipped; not cross-checked)");
-            index_count
+            info!(actual_record_count = fai_count, "counted records from .fai index (gzipped; not cross-checked)");
+            fai_count
         } else {
-            // For uncompressed input, cross-check against line count (cheap)
-            let line_count = count_lines(r1_src)?;
-            let file_count = line_count / 4;
-
-            if index_count != file_count {
+            let index = RecordIndex::build_from_path(r1_src)?;
+            let file_count = index.record_count();
+            if fai_count != file_count {
                 warn!(
-                    "index record count ({}) differs from file record count ({}); using file count (index may be stale)",
-                    index_count, file_count
+                    ".fai record count ({}) differs from file record count ({}); using file count (index may be stale)",
+                    fai_count, file_count
                 );
-                file_count
-            } else {
-                info!(actual_record_count = index_count, "counted records from index (verified)");
-                index_count
             }
+            info!(actual_record_count = file_count, "counted records (verified against .fai)");
+            file_count
         }
+    } else if !is_gzipped(r1_src) {
+        let index = RecordIndex::build_from_path(r1_src)?;
+        let count = index.record_count();
+        info!(actual_record_count = count, "counted records");
+        count
     } else {
         let line_count = count_lines(r1_src)?;
         let count = line_count / 4;
-        info!(actual_record_count = count, "counted records");
+        info!(actual_record_count = count, "counted records (line scan)");
         count
     };
 
@@ -332,51 +331,6 @@ where
     }
 
     Ok(n)
-}
-
-/// Attempt to count records using a `.fai` index file.
-///
-/// Looks for `<src>.fai` (e.g., `reads.fq.fai` or `reads.fq.gz.fai`).
-/// The samtools FASTQ index format has one line per record, so the number
-/// of lines in the index equals the record count.
-///
-/// Returns `Ok(Some(count))` if an index was found and read successfully,
-/// `Ok(None)` if no index exists, or an error if the index exists but
-/// cannot be read.
-fn count_records_from_index<P>(src: P) -> io::Result<Option<usize>>
-where
-    P: AsRef<Path>,
-{
-    let mut index_path = src.as_ref().as_os_str().to_owned();
-    index_path.push(".fai");
-    let index_path = PathBuf::from(index_path);
-
-    if !index_path.exists() {
-        return Ok(None);
-    }
-
-    info!(index = %index_path.display(), "found FASTQ index");
-
-    const LINE_FEED: u8 = b'\n';
-
-    let file = File::open(&index_path)?;
-    let mut reader = BufReader::new(file);
-    let mut n = 0;
-
-    loop {
-        let buf = reader.fill_buf()?;
-
-        if buf.is_empty() {
-            break;
-        }
-
-        n += bytecount::count(buf, LINE_FEED);
-
-        let len = buf.len();
-        reader.consume(len);
-    }
-
-    Ok(Some(n))
 }
 
 fn open_maybe_gz<P>(src: P) -> io::Result<Box<dyn BufRead>>
@@ -493,45 +447,30 @@ where
     let span = info_span!("subsample_skip_ahead", target_count);
     let _span_ctx = span.enter();
 
-    let r1_size = std::fs::metadata(r1_src)
-        .map_err(|e| SubsampleError::OpenFile(e, r1_src.into()))?
-        .len();
+    let mut r1_reader = IndexedReader::open(r1_src)
+        .map_err(|e| SubsampleError::OpenFile(e, r1_src.into()))?;
 
-    // Estimate record count from first 100 records
-    let avg_r1_size = estimate_avg_record_size(r1_src)?;
-    let estimated_total = (r1_size as f64 / avg_r1_size) as u64;
+    let total = r1_reader.index().record_count();
+    info!(total_records = total, "built index");
 
-    info!(
-        r1_size,
-        avg_r1_size,
-        estimated_total,
-        "estimated record count"
-    );
-
-    let target = target_count.min(estimated_total);
+    let target = (target_count as usize).min(total);
     let mut r1_buf = Vec::new();
 
-    let r1_selected = skip_ahead_sample_file(r1_src, r1_size, avg_r1_size, target, &mut rng)?;
+    let selected = r1_reader.skip_ahead_sample(target, &mut rng, |record| {
+        r1_buf.extend_from_slice(record.as_ref());
+        Ok(())
+    })?;
 
-    for (_, data) in &r1_selected {
-        r1_buf.extend_from_slice(data);
-    }
-
-    info!(selected = r1_selected.len(), "skip-ahead sampling complete");
+    info!(selected, "skip-ahead sampling complete");
 
     write_output_data(&r1_buf, r1_dst, 1)?;
-    
-    let percentage = if estimated_total > 0 {
-        r1_selected.len() as f64 / estimated_total as f64 * 100.0
+
+    let percentage = if total > 0 {
+        selected as f64 / total as f64 * 100.0
     } else {
         0.0
     };
-    info!(
-        "sampled ~{}/{} ({:.1}%) records",
-        r1_selected.len(),
-        estimated_total,
-        percentage
-    );
+    info!("sampled ~{}/{} ({:.1}%) records", selected, total, percentage);
 
     Ok(())
 }
@@ -1088,57 +1027,6 @@ where
     Ok(())
 }
 
-/// Sample from an uncompressed FASTQ file using geometric jumps.
-/// Returns Vec of (byte_position, record_bytes) for selected records.
-fn skip_ahead_sample_file<Rng>(
-    path: &Path,
-    file_size: u64,
-    avg_record_size: f64,
-    target: u64,
-    rng: &mut Rng,
-) -> Result<Vec<(u64, Vec<u8>)>, SubsampleError>
-where
-    Rng: rand::Rng,
-{
-    if file_size == 0 || target == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mean_jump_bytes = file_size as f64 / target as f64;
-    let mut file = BufReader::new(
-        File::open(path).map_err(|e| SubsampleError::OpenFile(e, path.into()))?,
-    );
-
-    let mut results = Vec::with_capacity(target as usize);
-    let mut current_pos: u64 = 0;
-    let mut last_record_pos: Option<u64> = None;
-
-    while (results.len() as u64) < target {
-        // Generate exponential jump
-        let jump = exponential_sample(rng, mean_jump_bytes) as u64;
-        current_pos = current_pos.saturating_add(jump.max(avg_record_size as u64));
-
-        if current_pos >= file_size {
-            break;
-        }
-
-        match find_record_after(&mut file, current_pos)? {
-            Some((record_pos, data)) => {
-                // Skip if we landed on the same record as last time
-                if last_record_pos == Some(record_pos) {
-                    continue;
-                }
-                last_record_pos = Some(record_pos);
-                current_pos = record_pos + data.len() as u64;
-                results.push((record_pos, data));
-            }
-            None => break,
-        }
-    }
-
-    Ok(results)
-}
-
 fn sample_tile_skip_ahead<Rng>(
     tile: &TileInfo,
     target: usize,
@@ -1147,99 +1035,22 @@ fn sample_tile_skip_ahead<Rng>(
 where
     Rng: rand::Rng,
 {
-    let r1_size = std::fs::metadata(&tile.r1_path)
-        .map_err(|e| SubsampleError::OpenFile(e, tile.r1_path.clone()))?
-        .len();
+    // Skip-ahead is single-end only (enforced by caller).
+    // Uses IndexedReader to jump between known record offsets.
+    let mut r1_reader = IndexedReader::open(&tile.r1_path)
+        .map_err(|e| SubsampleError::OpenFile(e, tile.r1_path.clone()))?;
 
-    if r1_size == 0 {
-        return Ok((Vec::new(), tile.r2_path.as_ref().map(|_| Vec::new())));
+    if r1_reader.index().record_count() == 0 {
+        return Ok((Vec::new(), None));
     }
-
-    let avg_r1_size = r1_size as f64 / tile.record_count as f64;
-
-    let r1_selected =
-        skip_ahead_sample_file(&tile.r1_path, r1_size, avg_r1_size, target as u64, rng)?;
 
     let mut r1_buf = Vec::new();
-    for (_, data) in &r1_selected {
-        r1_buf.extend_from_slice(data);
-    }
+    r1_reader.skip_ahead_sample(target, rng, |record| {
+        r1_buf.extend_from_slice(record.as_ref());
+        Ok(())
+    })?;
 
-    let r2_buf = if let Some(r2_path) = &tile.r2_path {
-        let r2_size = std::fs::metadata(r2_path)
-            .map_err(|e| SubsampleError::OpenFile(e, r2_path.clone()))?
-            .len();
-        let avg_r2_size = r2_size as f64 / tile.record_count as f64;
-
-        let mut buf = Vec::new();
-        let mut r2_file = BufReader::new(
-            File::open(r2_path).map_err(|e| SubsampleError::OpenFile(e, r2_path.clone()))?,
-        );
-
-        for &(r1_pos, _) in &r1_selected {
-            // Compute proportional position in R2
-            let r2_pos = (r1_pos as f64 / avg_r1_size * avg_r2_size) as u64;
-            let r2_pos = r2_pos.min(r2_size.saturating_sub(1));
-
-            if let Some((_, data)) = find_record_after(&mut r2_file, r2_pos)? {
-                buf.extend_from_slice(&data);
-            }
-        }
-
-        Some(buf)
-    } else {
-        None
-    };
-
-    Ok((r1_buf, r2_buf))
-}
-
-fn build_record_index(path: &Path) -> Result<Vec<u64>, SubsampleError> {
-    let mut reader = BufReader::new(
-        File::open(path).map_err(|e| SubsampleError::OpenFile(e, path.into()))?,
-    );
-
-    let mut offsets = Vec::new();
-    let mut line_buf = Vec::new();
-    let mut line_in_record = 0u8;
-
-    loop {
-        let pos = reader.stream_position()?;
-        line_buf.clear();
-
-        if reader.read_until(b'\n', &mut line_buf)? == 0 {
-            break;
-        }
-
-        if line_in_record == 0 {
-            offsets.push(pos);
-        }
-
-        line_in_record = (line_in_record + 1) % 4;
-    }
-
-    Ok(offsets)
-}
-
-fn read_record_at(reader: &mut BufReader<File>, offset: u64) -> io::Result<Vec<u8>> {
-    reader.seek(SeekFrom::Start(offset))?;
-
-    let mut data = Vec::new();
-    let mut line_buf = Vec::new();
-
-    for _ in 0..4 {
-        line_buf.clear();
-        if reader.read_until(b'\n', &mut line_buf)? == 0 {
-            // If at EOF without newline, add one
-            if !data.is_empty() && !data.ends_with(b"\n") {
-                data.push(b'\n');
-            }
-            break;
-        }
-        data.extend_from_slice(&line_buf);
-    }
-
-    Ok(data)
+    Ok((r1_buf, None))
 }
 
 fn sample_tile_exact<Rng>(
@@ -1250,10 +1061,14 @@ fn sample_tile_exact<Rng>(
 where
     Rng: rand::Rng,
 {
-    // Build index for R1
-    let r1_index = build_record_index(&tile.r1_path)?;
-    let actual_count = r1_index.len();
+    let mut r1_reader = IndexedReader::open(&tile.r1_path)
+        .map_err(|e| SubsampleError::OpenFile(e, tile.r1_path.clone()))?;
+    let actual_count = r1_reader.index().record_count();
     let target = target.min(actual_count);
+
+    if actual_count == 0 || target == 0 {
+        return Ok((Vec::new(), tile.r2_path.as_ref().map(|_| Vec::new())));
+    }
 
     // Select random indices
     let distribution = Uniform::new(0, actual_count).map_err(SubsampleError::InvalidUniformRange)?;
@@ -1267,14 +1082,6 @@ where
         }
     }
 
-    // Read selected R1 records
-    let mut r1_file = BufReader::new(
-        File::open(&tile.r1_path)
-            .map_err(|e| SubsampleError::OpenFile(e, tile.r1_path.clone()))?,
-    );
-    let mut r1_buf = Vec::new();
-
-    // Collect selected indices in sorted order for sequential reading
     let selected_indices: Vec<usize> = selected
         .iter()
         .enumerate()
@@ -1282,137 +1089,30 @@ where
         .map(|(i, _)| i)
         .collect();
 
-    for &idx in &selected_indices {
-        let data = read_record_at(&mut r1_file, r1_index[idx])?;
-        r1_buf.extend_from_slice(&data);
-    }
+    // Read selected R1 records
+    let mut r1_buf = Vec::new();
+    r1_reader.read_records_at(&selected_indices, |record| {
+        r1_buf.extend_from_slice(record.as_ref());
+        Ok(())
+    })?;
 
     // Read selected R2 records
     let r2_buf = if let Some(r2_path) = &tile.r2_path {
-        let r2_index = build_record_index(r2_path)?;
-        let mut r2_file = BufReader::new(
-            File::open(r2_path).map_err(|e| SubsampleError::OpenFile(e, r2_path.clone()))?,
-        );
+        let mut r2_reader = IndexedReader::open(r2_path)
+            .map_err(|e| SubsampleError::OpenFile(e, r2_path.clone()))?;
         let mut buf = Vec::new();
-
-        for &idx in &selected_indices {
-            if idx < r2_index.len() {
-                let data = read_record_at(&mut r2_file, r2_index[idx])?;
-                buf.extend_from_slice(&data);
-            }
-        }
-
+        let r2_count = r2_reader.index().record_count();
+        let r2_indices: Vec<usize> = selected_indices.iter().copied().filter(|&i| i < r2_count).collect();
+        r2_reader.read_records_at(&r2_indices, |record| {
+            buf.extend_from_slice(record.as_ref());
+            Ok(())
+        })?;
         Some(buf)
     } else {
         None
     };
 
     Ok((r1_buf, r2_buf))
-}
-
-/// Find the next valid FASTQ record after the given byte position.
-/// Returns (record_start_position, record_bytes) or None if EOF.
-fn find_record_after(
-    reader: &mut BufReader<File>,
-    pos: u64,
-) -> io::Result<Option<(u64, Vec<u8>)>> {
-    reader.seek(SeekFrom::Start(pos))?;
-
-    // Skip rest of current (partial) line
-    let mut discard = Vec::new();
-    if reader.read_until(b'\n', &mut discard)? == 0 {
-        return Ok(None);
-    }
-
-    // Try up to 4 line offsets to find a record boundary
-    for _ in 0..4 {
-        let candidate_pos = reader.stream_position()?;
-
-        let mut line1 = Vec::new();
-        if reader.read_until(b'\n', &mut line1)? == 0 {
-            return Ok(None);
-        }
-
-        if line1.starts_with(b"@") {
-            let mut line2 = Vec::new();
-            let mut line3 = Vec::new();
-            let mut line4 = Vec::new();
-
-            if reader.read_until(b'\n', &mut line2)? == 0 {
-                return Ok(None);
-            }
-            if reader.read_until(b'\n', &mut line3)? == 0 {
-                return Ok(None);
-            }
-            if reader.read_until(b'\n', &mut line4)? == 0 {
-                // Accept record at EOF without trailing newline
-                let mut data = Vec::new();
-                data.extend_from_slice(&line1);
-                data.extend_from_slice(&line2);
-                data.extend_from_slice(&line3);
-                data.extend_from_slice(&line4);
-                if !data.ends_with(b"\n") {
-                    data.push(b'\n');
-                }
-                return Ok(Some((candidate_pos, data)));
-            }
-
-            if line3.starts_with(b"+") {
-                let mut data = Vec::new();
-                data.extend_from_slice(&line1);
-                data.extend_from_slice(&line2);
-                data.extend_from_slice(&line3);
-                data.extend_from_slice(&line4);
-                return Ok(Some((candidate_pos, data)));
-            }
-
-            // Not a valid record, seek back and skip this line
-            reader.seek(SeekFrom::Start(candidate_pos))?;
-            let mut skip = Vec::new();
-            reader.read_until(b'\n', &mut skip)?;
-        }
-    }
-
-    Ok(None)
-}
-
-fn exponential_sample<Rng>(rng: &mut Rng, mean: f64) -> f64
-where
-    Rng: rand::Rng,
-{
-    -mean * rng.random::<f64>().ln()
-}
-
-fn estimate_avg_record_size(path: &Path) -> Result<f64, SubsampleError> {
-    let mut reader = BufReader::new(
-        File::open(path).map_err(|e| SubsampleError::OpenFile(e, path.into()))?,
-    );
-
-    let mut total_bytes: u64 = 0;
-    let mut records = 0u64;
-    let mut line_buf = Vec::new();
-    let max_records = 100;
-
-    while records < max_records {
-        let mut record_bytes: u64 = 0;
-
-        for _ in 0..4 {
-            line_buf.clear();
-            let n = reader.read_until(b'\n', &mut line_buf)?;
-            if n == 0 {
-                if record_bytes > 0 {
-                    return Ok(total_bytes as f64 / records.max(1) as f64);
-                }
-                return Ok(1.0); // avoid division by zero
-            }
-            record_bytes += n as u64;
-        }
-
-        total_bytes += record_bytes;
-        records += 1;
-    }
-
-    Ok(total_bytes as f64 / records as f64)
 }
 
 fn write_output_data(data: &[u8], dst: &Path, compression_threads: usize) -> io::Result<()> {
@@ -1612,80 +1312,6 @@ mod tests {
 
         let key = parse_tile_bin(b"INST:100:FC:3:1201:1:2");
         assert_eq!(key, Some((3u64 << 32) | 1201));
-    }
-
-    #[test]
-    fn test_exponential_sample() {
-        let mut rng = SmallRng::seed_from_u64(42);
-        let samples: Vec<f64> = (0..10000).map(|_| exponential_sample(&mut rng, 100.0)).collect();
-        let mean: f64 = samples.iter().sum::<f64>() / samples.len() as f64;
-        // Mean should be approximately 100
-        assert!((mean - 100.0).abs() < 5.0, "mean was {mean}");
-        // All samples should be positive
-        assert!(samples.iter().all(|&x| x > 0.0));
-    }
-
-    #[test]
-    fn test_find_record_after() -> io::Result<()> {
-        let dir = std::env::temp_dir().join("fq_test_find_record");
-        std::fs::create_dir_all(&dir)?;
-
-        let data = b"@r1\nACGT\n+\nFFFF\n@r2\nTGCA\n+\nGGGG\n@r3\nCCCC\n+\nHHHH\n";
-        let path = dir.join("test.fq");
-        std::fs::write(&path, data)?;
-
-        let mut reader = BufReader::new(File::open(&path)?);
-
-        // find_record_after always skips the rest of the current line first,
-        // so seeking to 0 skips "@r1\n" and finds r2
-        let result = find_record_after(&mut reader, 0)?;
-        assert!(result.is_some());
-        let (pos, rec_data) = result.unwrap();
-        assert_eq!(pos, 16); // r2 starts at byte 16
-        assert!(rec_data.starts_with(b"@r2\n"));
-
-        // Seeking into the middle of r1 also finds r2
-        let result = find_record_after(&mut reader, 5)?;
-        assert!(result.is_some());
-        let (pos, rec_data) = result.unwrap();
-        assert_eq!(pos, 16);
-        assert!(rec_data.starts_with(b"@r2\n"));
-
-        // Seeking into r2 finds r3
-        let result = find_record_after(&mut reader, 20)?;
-        assert!(result.is_some());
-        let (_, rec_data) = result.unwrap();
-        assert!(rec_data.starts_with(b"@r3\n"));
-
-        std::fs::remove_dir_all(&dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_build_record_index() -> Result<(), SubsampleError> {
-        let dir = std::env::temp_dir().join("fq_test_index");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let data = b"@r1\nACGT\n+\nFFFF\n@r2\nTGCA\n+\nGGGG\n@r3\nCCCC\n+\nHHHH\n";
-        let path = dir.join("test.fq");
-        std::fs::write(&path, data).unwrap();
-
-        let index = build_record_index(&path)?;
-        assert_eq!(index.len(), 3);
-        assert_eq!(index[0], 0);
-        // Each record is "@rN\nXXXX\n+\nXXXX\n" = 4 + 5 + 2 + 5 = 16 bytes... let me be precise
-        // "@r1\n" = 4, "ACGT\n" = 5, "+\n" = 2, "FFFF\n" = 5 → 16
-        // But with our record: @r1\nACGT\n+\nFFFF\n = 18 bytes
-        // Actually: @r1 = 3 bytes + \n = 4; ACGT + \n = 5; + + \n = 2; FFFF + \n = 5 → total 16
-        // Hmm: "@r1\n" is 4 bytes, "ACGT\n" is 5 bytes, "+\n" is 2 bytes, "FFFF\n" is 5 bytes = 16
-        // Wait: @ r 1 \n = 4, A C G T \n = 5, + \n = 2, F F F F \n = 5 => 16
-        // Then @r2 starts at offset 16
-        assert_eq!(index[1], 16);
-        assert_eq!(index[2], 32);
-
-        std::fs::remove_dir_all(&dir).unwrap();
-
-        Ok(())
     }
 
     #[test]
@@ -1960,54 +1586,4 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_count_records_from_index_found() -> io::Result<()> {
-        let dir = std::env::temp_dir().join("fq_test_index_count2");
-        std::fs::create_dir_all(&dir)?;
-
-        let fq_path = dir.join("test.fq");
-        let fai_path = dir.join("test.fq.fai");
-
-        std::fs::write(&fq_path, b"@r1\nACGT\n+\nFFFF\n@r2\nTGCA\n+\nFFFF\n@r3\nGGGG\n+\nFFFF\n@r4\nCCCC\n+\nFFFF\n")?;
-        std::fs::write(&fai_path, b"r1\t4\t4\t4\t5\t14\nr2\t4\t24\t4\t5\t34\nr3\t4\t44\t4\t5\t54\nr4\t4\t64\t4\t5\t74\n")?;
-
-        let result = count_records_from_index(&fq_path)?;
-        assert_eq!(result, Some(4));
-
-        std::fs::remove_dir_all(&dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_count_records_from_index_missing() -> io::Result<()> {
-        let dir = std::env::temp_dir().join("fq_test_index_missing2");
-        std::fs::create_dir_all(&dir)?;
-
-        let fq_path = dir.join("test.fq");
-        std::fs::write(&fq_path, b"@r1\nACGT\n+\nFFFF\n")?;
-
-        let result = count_records_from_index(&fq_path)?;
-        assert_eq!(result, None);
-
-        std::fs::remove_dir_all(&dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_count_records_from_index_gz() -> io::Result<()> {
-        let dir = std::env::temp_dir().join("fq_test_index_gz2");
-        std::fs::create_dir_all(&dir)?;
-
-        let fq_path = dir.join("test.fq.gz");
-        let fai_path = dir.join("test.fq.gz.fai");
-
-        std::fs::write(&fq_path, b"dummy")?;
-        std::fs::write(&fai_path, b"r1\t4\t4\t4\t5\t14\nr2\t4\t24\t4\t5\t34\nr3\t4\t44\t4\t5\t54\n")?;
-
-        let result = count_records_from_index(&fq_path)?;
-        assert_eq!(result, Some(3));
-
-        std::fs::remove_dir_all(&dir)?;
-        Ok(())
-    }
 }
