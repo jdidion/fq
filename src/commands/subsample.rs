@@ -4,7 +4,7 @@ use std::{
     io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     ops::{Bound, RangeBounds},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, mpsc},
 };
 
 use bitvec::vec::BitVec;
@@ -576,6 +576,53 @@ fn parse_tile_bin(name: &[u8]) -> Option<u64> {
     Some((lane as u64) << 32 | (tile as u64))
 }
 
+struct TileResult {
+    r1_data: Vec<u8>,
+    r2_data: Option<Vec<u8>>,
+}
+
+enum OutputWriter {
+    Plain(BufWriter<File>),
+    Gz(GzEncoder<BufWriter<File>>),
+}
+
+impl OutputWriter {
+    fn create(dst: &Path) -> io::Result<Self> {
+        let file = BufWriter::new(File::create(dst)?);
+        if is_gzipped(dst) {
+            Ok(OutputWriter::Gz(GzEncoder::new(file, Compression::default())))
+        } else {
+            Ok(OutputWriter::Plain(file))
+        }
+    }
+
+    fn finish(self) -> io::Result<()> {
+        match self {
+            OutputWriter::Plain(mut w) => w.flush(),
+            OutputWriter::Gz(w) => {
+                w.finish()?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Write for OutputWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            OutputWriter::Plain(w) => w.write(buf),
+            OutputWriter::Gz(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            OutputWriter::Plain(w) => w.flush(),
+            OutputWriter::Gz(w) => w.flush(),
+        }
+    }
+}
+
 struct TileInfo {
     record_count: usize,
     r1_path: PathBuf,
@@ -777,37 +824,62 @@ where
         return Ok(());
     }
 
-    // Sample tiles in parallel
+    // Sample tiles and stream results to a writer thread via channel.
+    // This avoids holding all sampled data in memory at once.
+    let paired = r2_src.is_some();
+    let threads = sampling_threads.min(retained_count).max(1);
+
     info!(
         fast,
-        sampling_threads,
+        sampling_threads = threads,
         "sampling {} tiles",
         retained_count
     );
 
-    let paired = r2_src.is_some();
-    let r1_results: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-    let r2_results: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    let (tx, rx) = mpsc::sync_channel::<TileResult>(threads * 2);
     let rng = Mutex::new(rng);
 
-    let threads = sampling_threads.min(retained_count).max(1);
+    let selected_records = std::thread::scope(|s| -> Result<usize, SubsampleError> {
+        // Writer thread: receives tile results and writes to output files
+        let writer_handle = s.spawn(|| -> Result<usize, SubsampleError> {
+            let mut r1_writer = OutputWriter::create(r1_dst)?;
+            let mut r2_writer = if paired {
+                Some(OutputWriter::create(r2_dst.unwrap())?)
+            } else {
+                None
+            };
+            let mut selected = 0usize;
 
-    std::thread::scope(|s| -> Result<(), SubsampleError> {
+            for result in rx {
+                selected += result.r1_data.iter().filter(|&&b| b == b'\n').count() / 4;
+                r1_writer.write_all(&result.r1_data)?;
+                if let (Some(w), Some(data)) = (&mut r2_writer, result.r2_data) {
+                    w.write_all(&data)?;
+                }
+            }
+
+            r1_writer.finish()?;
+            if let Some(w) = r2_writer {
+                w.finish()?;
+            }
+
+            Ok(selected)
+        });
+
+        // Sampling threads: process tiles and send results through channel
         let chunk_size = (retained_count + threads - 1) / threads;
         let chunks: Vec<&[&TileInfo]> = retained_tiles.chunks(chunk_size).collect();
 
         let handles: Vec<_> = chunks
             .into_iter()
             .map(|chunk| {
-                let r1_results = &r1_results;
-                let r2_results = &r2_results;
+                let tx = tx.clone();
                 let rng = &rng;
 
                 s.spawn(move || -> Result<(), SubsampleError> {
                     for tile in chunk {
                         let mut tile_rng = {
                             let mut rng = rng.lock().unwrap();
-                            // Derive a per-tile RNG from the main RNG
                             SmallRng::seed_from_u64(rng.random())
                         };
 
@@ -819,44 +891,22 @@ where
                             sample_tile_exact(tile, record_count_per_tile, &mut tile_rng)?
                         };
 
-                        r1_results.lock().unwrap().push(r1_data);
-                        if let Some(r2_data) = r2_data {
-                            r2_results.lock().unwrap().push(r2_data);
-                        }
+                        tx.send(TileResult { r1_data, r2_data }).unwrap();
                     }
                     Ok(())
                 })
             })
             .collect();
 
+        // Drop the original sender so the writer sees EOF when all clones are dropped
+        drop(tx);
+
         for handle in handles {
             handle.join().unwrap()?;
         }
 
-        Ok(())
+        writer_handle.join().unwrap()
     })?;
-
-    // Concatenate and write output
-    let r1_results = r1_results.into_inner().unwrap();
-    let r1_total_bytes: usize = r1_results.iter().map(|v| v.len()).sum();
-    let mut r1_combined = Vec::with_capacity(r1_total_bytes);
-    for chunk in &r1_results {
-        r1_combined.extend_from_slice(chunk);
-    }
-
-    let selected_records = r1_combined.iter().filter(|&&b| b == b'\n').count() / 4;
-
-    write_output_data(&r1_combined, r1_dst, compression_threads)?;
-
-    if paired {
-        let r2_results = r2_results.into_inner().unwrap();
-        let r2_total_bytes: usize = r2_results.iter().map(|v| v.len()).sum();
-        let mut r2_combined = Vec::with_capacity(r2_total_bytes);
-        for chunk in &r2_results {
-            r2_combined.extend_from_slice(chunk);
-        }
-        write_output_data(&r2_combined, r2_dst.unwrap(), compression_threads)?;
-    }
 
     let percentage = if total_records > 0 {
         selected_records as f64 / total_records as f64 * 100.0
