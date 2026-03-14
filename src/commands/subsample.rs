@@ -26,8 +26,6 @@ use crate::{
 const VALID_PROBABILITY_RANGE: (Bound<f64>, Bound<f64>) =
     (Bound::Excluded(0.0), Bound::Excluded(1.0));
 
-// ===== Main dispatch =====
-
 pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
     let r1_src = &args.r1_src;
     let r1_dst = &args.r1_dst;
@@ -47,12 +45,21 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
 
     let r2 = (r2_src.map(|p| &**p), r2_dst.map(|p| &**p));
 
-    if let Some(record_count_per_tile) = args.record_count_per_tile {
+    if args.bin_by_tile || args.record_count_per_tile.is_some() {
+        let tile_count_mode = if let Some(record_count_per_tile) = args.record_count_per_tile {
+            TileCountMode::Explicit(record_count_per_tile)
+        } else if let Some(probability) = args.probability {
+            TileCountMode::FromProbability(probability)
+        } else if let Some(record_count) = args.record_count {
+            TileCountMode::FromRecordCount(record_count)
+        } else {
+            unreachable!();
+        };
         subsample_by_tile(
             (r1_src, r1_dst),
             r2,
             rng,
-            TileCountMode::Explicit(record_count_per_tile),
+            tile_count_mode,
             args.fast,
             args.sampling_threads,
             args.compression_threads,
@@ -60,36 +67,11 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
             args.temp_dir.as_deref(),
         )?;
     } else if let Some(probability) = args.probability {
-        if args.bin_by_tile {
-            subsample_by_tile(
-                (r1_src, r1_dst),
-                r2,
-                rng,
-                TileCountMode::FromProbability(probability),
-                args.fast,
-                args.sampling_threads,
-                args.compression_threads,
-                args.in_memory,
-                args.temp_dir.as_deref(),
-            )?;
-        } else {
-            subsample_approximate((r1_src, r1_dst), r2, rng, probability)?;
-        }
+        subsample_approximate((r1_src, r1_dst), r2, rng, probability)?;
     } else if let Some(record_count) = args.record_count {
-        if args.bin_by_tile {
-            subsample_by_tile(
-                (r1_src, r1_dst),
-                r2,
-                rng,
-                TileCountMode::FromRecordCount(record_count),
-                args.fast,
-                args.sampling_threads,
-                args.compression_threads,
-                args.in_memory,
-                args.temp_dir.as_deref(),
-            )?;
-        } else if args.fast && !is_gzipped(r1_src) {
-            subsample_skip_ahead((r1_src, r1_dst), r2, rng, record_count)?;
+        // Skip-ahead only works for single-end uncompressed input
+        if args.fast && !is_gzipped(r1_src) && r2_src.is_none() {
+            subsample_skip_ahead((r1_src, r1_dst), rng, record_count)?;
         } else {
             subsample_exact((r1_src, r1_dst), r2, rng, record_count)?;
         }
@@ -103,10 +85,13 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
 }
 
 fn is_gzipped(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("gz")
+    path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ["gz", "bgz"]
+        .contains(&ext))
+        .unwrap_or(false)
 }
-
-// ===== Approximate (probability) sampling =====
 
 fn subsample_approximate<Rng>(
     (r1_src, r1_dst): (&Path, &Path),
@@ -229,8 +214,6 @@ where
     Ok((n, total))
 }
 
-// ===== Exact (bitmap) sampling =====
-
 fn subsample_exact<Rng>(
     (r1_src, r1_dst): (&Path, &Path),
     (r2_src, r2_dst): (Option<&Path>, Option<&Path>),
@@ -245,10 +228,15 @@ where
 
     info!("counting records");
 
-    let line_count = count_lines(r1_src)?;
-    let actual_record_count = line_count / 4;
-
-    info!(actual_record_count = actual_record_count, "counted records");
+    let actual_record_count = if let Some(count) = count_records_from_index(r1_src)? {
+        info!(actual_record_count = count, "counted records from index");
+        count
+    } else {
+        let line_count = count_lines(r1_src)?;
+        let count = line_count / 4;
+        info!(actual_record_count = count, "counted records");
+        count
+    };
 
     let n = u64::try_from(actual_record_count)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -321,6 +309,51 @@ where
     }
 
     Ok(n)
+}
+
+/// Attempt to count records using a `.fai` index file.
+///
+/// Looks for `<src>.fai` (e.g., `reads.fq.fai` or `reads.fq.gz.fai`).
+/// The samtools FASTQ index format has one line per record, so the number
+/// of lines in the index equals the record count.
+///
+/// Returns `Ok(Some(count))` if an index was found and read successfully,
+/// `Ok(None)` if no index exists, or an error if the index exists but
+/// cannot be read.
+fn count_records_from_index<P>(src: P) -> io::Result<Option<usize>>
+where
+    P: AsRef<Path>,
+{
+    let mut index_path = src.as_ref().as_os_str().to_owned();
+    index_path.push(".fai");
+    let index_path = PathBuf::from(index_path);
+
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    info!(index = %index_path.display(), "found FASTQ index");
+
+    const LINE_FEED: u8 = b'\n';
+
+    let file = File::open(&index_path)?;
+    let mut reader = BufReader::new(file);
+    let mut n = 0;
+
+    loop {
+        let buf = reader.fill_buf()?;
+
+        if buf.is_empty() {
+            break;
+        }
+
+        n += bytecount::count(buf, LINE_FEED);
+
+        let len = buf.len();
+        reader.consume(len);
+    }
+
+    Ok(Some(n))
 }
 
 fn open_maybe_gz<P>(src: P) -> io::Result<Box<dyn BufRead>>
@@ -426,11 +459,8 @@ where
     Ok(())
 }
 
-// ===== Skip-ahead sampling for non-tile --record-count =====
-
 fn subsample_skip_ahead<Rng>(
     (r1_src, r1_dst): (&Path, &Path),
-    (r2_src, r2_dst): (Option<&Path>, Option<&Path>),
     mut rng: Rng,
     target_count: u64,
 ) -> Result<(), SubsampleError>
@@ -457,7 +487,6 @@ where
 
     let target = target_count.min(estimated_total);
     let mut r1_buf = Vec::new();
-    let mut r2_buf = Vec::new();
 
     let r1_selected = skip_ahead_sample_file(r1_src, r1_size, avg_r1_size, target, &mut rng)?;
 
@@ -467,33 +496,8 @@ where
 
     info!(selected = r1_selected.len(), "skip-ahead sampling complete");
 
-    match (r2_src, r2_dst) {
-        (Some(r2_src), Some(r2_dst)) => {
-            let r2_size = std::fs::metadata(r2_src)
-                .map_err(|e| SubsampleError::OpenFile(e, r2_src.into()))?
-                .len();
-            // For each selected R1 record, seek to proportional position in R2
-            let mut r2_file = BufReader::new(
-                File::open(r2_src).map_err(|e| SubsampleError::OpenFile(e, r2_src.into()))?,
-            );
-
-            for &(r1_pos, _) in &r1_selected {
-                let r2_pos = (r1_pos as f64 / r1_size as f64 * r2_size as f64) as u64;
-                if let Some((_, data)) = find_record_after(&mut r2_file, r2_pos.min(r2_size - 1))? {
-                    r2_buf.extend_from_slice(&data);
-                }
-            }
-
-            write_output_data(&r1_buf, r1_dst, 1)?;
-            write_output_data(&r2_buf, r2_dst, 1)?;
-        }
-        (Some(_), None) => return Err(SubsampleError::MissingDestination("r2-dst")),
-        (None, Some(_)) => return Err(SubsampleError::MissingSource("r2-src")),
-        (None, None) => {
-            write_output_data(&r1_buf, r1_dst, 1)?;
-        }
-    }
-
+    write_output_data(&r1_buf, r1_dst, 1)?;
+    
     let percentage = if estimated_total > 0 {
         r1_selected.len() as f64 / estimated_total as f64 * 100.0
     } else {
@@ -508,8 +512,6 @@ where
 
     Ok(())
 }
-
-// ===== Tile binning =====
 
 enum TileCountMode {
     Explicit(u64),
@@ -781,7 +783,9 @@ where
                             SmallRng::seed_from_u64(rng.random())
                         };
 
-                        let (r1_data, r2_data) = if fast {
+                        // Skip-ahead only works for single-end; paired-end
+                        // always uses exact indexed sampling.
+                        let (r1_data, r2_data) = if fast && !paired {
                             sample_tile_skip_ahead(tile, record_count_per_tile, &mut tile_rng)?
                         } else {
                             sample_tile_exact(tile, record_count_per_tile, &mut tile_rng)?
@@ -838,8 +842,6 @@ where
 
     Ok(())
 }
-
-// ===== In-memory tile binning =====
 
 struct InMemoryTile {
     r1_records: Vec<Vec<u8>>,
@@ -1005,8 +1007,6 @@ where
     Ok(())
 }
 
-// ===== Skip-ahead sampling =====
-
 /// Sample from an uncompressed FASTQ file using geometric jumps.
 /// Returns Vec of (byte_position, record_bytes) for selected records.
 fn skip_ahead_sample_file<Rng>(
@@ -1112,8 +1112,6 @@ where
 
     Ok((r1_buf, r2_buf))
 }
-
-// ===== Exact indexed sampling =====
 
 fn build_record_index(path: &Path) -> Result<Vec<u64>, SubsampleError> {
     let mut reader = BufReader::new(
@@ -1231,8 +1229,6 @@ where
     Ok((r1_buf, r2_buf))
 }
 
-// ===== Record boundary detection =====
-
 /// Find the next valid FASTQ record after the given byte position.
 /// Returns (record_start_position, record_bytes) or None if EOF.
 fn find_record_after(
@@ -1298,8 +1294,6 @@ fn find_record_after(
 
     Ok(None)
 }
-
-// ===== Helpers =====
 
 fn exponential_sample<Rng>(rng: &mut Rng, mean: f64) -> f64
 where
@@ -1388,8 +1382,6 @@ fn write_output_parallel_gz(data: &[u8], dst: &Path, threads: usize) -> io::Resu
     Ok(())
 }
 
-// ===== Errors =====
-
 #[derive(Debug, Error)]
 pub enum SubsampleError {
     #[error("I/O error")]
@@ -1411,8 +1403,6 @@ pub enum SubsampleError {
     #[error("invalid uniform range")]
     InvalidUniformRange(rand::distr::uniform::Error),
 }
-
-// ===== Tests =====
 
 #[cfg(test)]
 mod tests {
@@ -1886,6 +1876,57 @@ mod tests {
         assert!(output.is_empty(), "expected empty output, got: {output}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_records_from_index_found() -> io::Result<()> {
+        let dir = std::env::temp_dir().join("fq_test_index_count2");
+        std::fs::create_dir_all(&dir)?;
+
+        let fq_path = dir.join("test.fq");
+        let fai_path = dir.join("test.fq.fai");
+
+        std::fs::write(&fq_path, b"@r1\nACGT\n+\nFFFF\n@r2\nTGCA\n+\nFFFF\n@r3\nGGGG\n+\nFFFF\n@r4\nCCCC\n+\nFFFF\n")?;
+        std::fs::write(&fai_path, b"r1\t4\t4\t4\t5\t14\nr2\t4\t24\t4\t5\t34\nr3\t4\t44\t4\t5\t54\nr4\t4\t64\t4\t5\t74\n")?;
+
+        let result = count_records_from_index(&fq_path)?;
+        assert_eq!(result, Some(4));
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_records_from_index_missing() -> io::Result<()> {
+        let dir = std::env::temp_dir().join("fq_test_index_missing2");
+        std::fs::create_dir_all(&dir)?;
+
+        let fq_path = dir.join("test.fq");
+        std::fs::write(&fq_path, b"@r1\nACGT\n+\nFFFF\n")?;
+
+        let result = count_records_from_index(&fq_path)?;
+        assert_eq!(result, None);
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_records_from_index_gz() -> io::Result<()> {
+        let dir = std::env::temp_dir().join("fq_test_index_gz2");
+        std::fs::create_dir_all(&dir)?;
+
+        let fq_path = dir.join("test.fq.gz");
+        let fai_path = dir.join("test.fq.gz.fai");
+
+        std::fs::write(&fq_path, b"dummy")?;
+        std::fs::write(&fai_path, b"r1\t4\t4\t4\t5\t14\nr2\t4\t24\t4\t5\t34\nr3\t4\t44\t4\t5\t54\n")?;
+
+        let result = count_records_from_index(&fq_path)?;
+        assert_eq!(result, Some(3));
+
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 }
