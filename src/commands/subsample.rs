@@ -228,15 +228,43 @@ where
 
     info!("counting records");
 
-    let actual_record_count = if let Some(count) = count_records_from_index(r1_src)? {
-        info!(actual_record_count = count, "counted records from index");
-        count
+    let actual_record_count = if let Some(index_count) = count_records_from_index(r1_src)? {
+        if is_gzipped(r1_src) {
+            // For gzipped input, trust the index (decompressing to cross-check
+            // would negate the performance benefit of having an index).
+            info!(actual_record_count = index_count, "counted records from index (gzipped; not cross-checked)");
+            index_count
+        } else {
+            // For uncompressed input, cross-check against line count (cheap)
+            let line_count = count_lines(r1_src)?;
+            let file_count = line_count / 4;
+
+            if index_count != file_count {
+                warn!(
+                    "index record count ({}) differs from file record count ({}); using file count (index may be stale)",
+                    index_count, file_count
+                );
+                file_count
+            } else {
+                info!(actual_record_count = index_count, "counted records from index (verified)");
+                index_count
+            }
+        }
     } else {
         let line_count = count_lines(r1_src)?;
         let count = line_count / 4;
         info!(actual_record_count = count, "counted records");
         count
     };
+
+    if actual_record_count == 0 {
+        info!("input is empty; producing empty output");
+        fastq::fs::create(r1_dst).map_err(|e| SubsampleError::CreateFile(e, r1_dst.into()))?;
+        if let Some(r2_dst) = r2_dst {
+            fastq::fs::create(r2_dst).map_err(|e| SubsampleError::CreateFile(e, r2_dst.into()))?;
+        }
+        return Ok(());
+    }
 
     let n = u64::try_from(actual_record_count)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
