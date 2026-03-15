@@ -4,7 +4,7 @@ use std::{
     io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     ops::{Bound, RangeBounds},
     path::{Path, PathBuf},
-    sync::{Mutex, mpsc},
+    sync::mpsc,
 };
 
 use bitvec::vec::BitVec;
@@ -85,12 +85,7 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
 }
 
 fn is_gzipped(path: &Path) -> bool {
-    path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|ext| ["gz", "bgz"]
-        .contains(&ext))
-        .unwrap_or(false)
+    path.extension().and_then(|e| e.to_str()) == Some("gz")
 }
 
 fn subsample_approximate<Rng>(
@@ -624,6 +619,7 @@ impl Write for OutputWriter {
 }
 
 struct TileInfo {
+    bin_key: u64,
     record_count: usize,
     r1_path: PathBuf,
     r2_path: Option<PathBuf>,
@@ -670,24 +666,31 @@ fn write_tile_temp_files(
         }
 
         if let Some(bin_key) = parse_tile_bin(r1_rec.name()) {
-            let tw = tile_writers.entry(bin_key).or_insert_with(|| {
+            if !tile_writers.contains_key(&bin_key) {
                 let r1_path = temp_dir.join(format!("{bin_key}.r1.fq"));
-                let r1_file = BufWriter::new(File::create(&r1_path).unwrap());
+                let r1_file = BufWriter::new(
+                    File::create(&r1_path)
+                        .map_err(|e| SubsampleError::CreateFile(e, r1_path.clone()))?,
+                );
                 let (r2_writer, r2_path) = if paired {
                     let p = temp_dir.join(format!("{bin_key}.r2.fq"));
-                    let f = BufWriter::new(File::create(&p).unwrap());
+                    let f = BufWriter::new(
+                        File::create(&p)
+                            .map_err(|e| SubsampleError::CreateFile(e, p.clone()))?,
+                    );
                     (Some(fastq::io::Writer::new(f)), Some(p))
                 } else {
                     (None, None)
                 };
-                TileWriter {
+                tile_writers.insert(bin_key, TileWriter {
                     r1: fastq::io::Writer::new(r1_file),
                     r1_path,
                     r2: r2_writer,
                     r2_path,
                     record_count: 0,
-                }
-            });
+                });
+            }
+            let tw = tile_writers.get_mut(&bin_key).unwrap();
 
             tw.r1.write_record(&r1_rec)?;
             if let Some(r2w) = tw.r2.as_mut() {
@@ -700,14 +703,17 @@ fn write_tile_temp_files(
     }
 
     // Collect TileInfo (writers are dropped here, flushing buffers)
-    let tiles: Vec<TileInfo> = tile_writers
-        .into_values()
-        .map(|tw| TileInfo {
+    let mut tiles: Vec<TileInfo> = tile_writers
+        .into_iter()
+        .map(|(key, tw)| TileInfo {
+            bin_key: key,
             record_count: tw.record_count,
             r1_path: tw.r1_path,
             r2_path: tw.r2_path,
         })
         .collect();
+    // Sort by bin key for deterministic processing order
+    tiles.sort_unstable_by_key(|t| t.bin_key);
 
     Ok((tiles, parse_failures))
 }
@@ -715,7 +721,7 @@ fn write_tile_temp_files(
 fn subsample_by_tile<Rng>(
     (r1_src, r1_dst): (&Path, &Path),
     (r2_src, r2_dst): (Option<&Path>, Option<&Path>),
-    rng: Rng,
+    mut rng: Rng,
     mode: TileCountMode,
     fast: bool,
     sampling_threads: usize,
@@ -836,8 +842,8 @@ where
         retained_count
     );
 
+    let base_seed: u64 = rng.random();
     let (tx, rx) = mpsc::sync_channel::<TileResult>(threads * 2);
-    let rng = Mutex::new(rng);
 
     let selected_records = std::thread::scope(|s| -> Result<usize, SubsampleError> {
         // Writer thread: receives tile results and writes to output files
@@ -874,14 +880,11 @@ where
             .into_iter()
             .map(|chunk| {
                 let tx = tx.clone();
-                let rng = &rng;
 
                 s.spawn(move || -> Result<(), SubsampleError> {
                     for tile in chunk {
-                        let mut tile_rng = {
-                            let mut rng = rng.lock().unwrap();
-                            SmallRng::seed_from_u64(rng.random())
-                        };
+                        let mut tile_rng =
+                            SmallRng::seed_from_u64(base_seed.wrapping_add(tile.bin_key));
 
                         // Skip-ahead only works for single-end; paired-end
                         // always uses exact indexed sampling.
