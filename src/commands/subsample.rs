@@ -781,6 +781,9 @@ where
         retained_count
     );
 
+    // Derive a base seed from the caller's RNG once, then derive per-tile
+    // seeds deterministically from base_seed + bin_key. This avoids a shared
+    // mutex and makes output reproducible regardless of thread scheduling.
     let base_seed: u64 = rng.random();
     let (tx, rx) = mpsc::sync_channel::<TileResult>(threads * 2);
 

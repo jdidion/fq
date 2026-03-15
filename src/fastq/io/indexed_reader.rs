@@ -117,8 +117,11 @@ impl<R: Read + Seek> IndexedReader<R> {
 
         let mean_jump = total as f64 / target as f64;
         let mut record = Record::default();
-        let mut current: usize = 0;
         let mut count = 0;
+
+        // Draw the first jump to avoid always starting at record 0
+        let first = (-mean_jump * rng.random::<f64>().ln()).ceil() as usize;
+        let mut current: usize = first.min(total.saturating_sub(1));
 
         while count < target && current < total {
             self.read_record_at(current, &mut record)?;
