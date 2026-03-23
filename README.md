@@ -2,7 +2,7 @@
 
 [![CI status](https://github.com/stjude-rust-labs/fq/workflows/CI/badge.svg)](https://github.com/stjude-rust-labs/fq/actions)
 
-**fq** filters, generates, subsamples, and validates [FASTQ] files.
+**fq** filters, subsamples, and validates [FASTQ] files.
 
 [FASTQ]: https://en.wikipedia.org/wiki/FASTQ_format
 
@@ -66,8 +66,7 @@ $ docker image build --tag fq:0.12.0 .
 
 ## Usage
 
-fq provides subcommands for filtering, generating, subsampling, and
-validating FASTQ files.
+fq provides subcommands for filtering, subsampling, and validating FASTQ files.
 
 ### filter
 
