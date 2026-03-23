@@ -40,7 +40,7 @@ impl SingleReadValidator for ConsistentSeqQualValidator {
 }
 
 #[derive(Debug, Error)]
-#[error("sequence-quality scores lengths mismatch: expected {actual}, got {expected}")]
+#[error("sequence-quality scores lengths mismatch: expected {expected}, got {actual}")]
 struct ValidationError {
     actual: usize,
     expected: usize,

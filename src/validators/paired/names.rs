@@ -40,7 +40,7 @@ impl PairedReadValidator for NamesValidator {
 }
 
 #[derive(Debug, Error)]
-#[error("names mismatch: expected '{actual}', got '{expected}'")]
+#[error("names mismatch: expected '{expected}', got '{actual}'")]
 struct ValidationError {
     actual: String,
     expected: String,
