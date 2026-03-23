@@ -30,7 +30,8 @@ impl Metric for MinSequenceLength {
     }
 
     fn println(&self) {
-        println!("{NAME}\t{}", self.len);
+        let len = self.initialized.then_some(self.len);
+        println!("{NAME}\t{}", len.unwrap_or_default());
     }
 }
 
