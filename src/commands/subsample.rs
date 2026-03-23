@@ -8,7 +8,7 @@ use std::{
 use bitvec::vec::BitVec;
 use flate2::bufread::MultiGzDecoder;
 use rand::{
-    SeedableRng,
+    RngExt, SeedableRng,
     distr::{Distribution, Uniform},
     rngs::SmallRng,
 };
@@ -37,7 +37,7 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
         SmallRng::seed_from_u64(seed)
     } else {
         info!("initializing rng from entropy");
-        SmallRng::from_os_rng()
+        rand::make_rng()
     };
 
     if let Some(probability) = args.probability {
