@@ -32,6 +32,9 @@
     the names validator (P001). If P001 is disabled, it will now get
     re-enabled.
 
+  * commands/lint: Support the duplicate name validator for single inputs
+    ([#47]).
+
   * fastq/record: Split name from definition on first separator.
 
     This previously searched for the separator from the end of the definition,
@@ -40,6 +43,7 @@
 
     This also affects how the name is extracted in the `filter` command.
 
+[#47]: https://github.com/stjude-rust-labs/fq/issues/47
 [#48]: https://github.com/stjude-rust-labs/fq/issues/48
 [#49]: https://github.com/stjude-rust-labs/fq/issues/49
 [#51]: https://github.com/stjude-rust-labs/fq/issues/51
