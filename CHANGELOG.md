@@ -26,6 +26,8 @@
     which may contain part of the description if the separator appears multiple
     times. It now searches from the beginning of the definition.
 
+    This also affects how the name is extracted in the `filter` command.
+
 [#51]: https://github.com/stjude-rust-labs/fq/issues/51
 [#52]: https://github.com/stjude-rust-labs/fq/issues/52
 

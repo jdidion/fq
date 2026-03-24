@@ -76,15 +76,12 @@ where
 const ID_START_OFFSET: usize = 1;
 
 fn name_id(name: &[u8]) -> &[u8] {
-    let pos = name.iter().rev().position(|&b| b == b'/' || b == b' ');
+    let end = name
+        .iter()
+        .position(|&b| b == b'/' || b == b' ')
+        .unwrap_or(name.len());
 
-    if let Some(i) = pos {
-        let len = name.len();
-        let end = len - i - 1;
-        &name[ID_START_OFFSET..end]
-    } else {
-        &name[ID_START_OFFSET..]
-    }
+    &name[ID_START_OFFSET..end]
 }
 
 pub fn filter(args: FilterArgs) -> Result<(), FilterError> {
@@ -251,9 +248,9 @@ mod tests {
 
     #[test]
     fn test_name_id() {
-        assert_eq!(name_id("@fqlib:1/1".as_bytes()), b"fqlib:1");
-        assert_eq!(name_id("@fqlib:1 1".as_bytes()), b"fqlib:1");
-        assert_eq!(name_id("@fqlib:1".as_bytes()), b"fqlib:1");
+        assert_eq!(name_id("@fqlib/1".as_bytes()), b"fqlib");
+        assert_eq!(name_id("@fqlib 1".as_bytes()), b"fqlib");
+        assert_eq!(name_id("@fqlib/1 RG:rg0".as_bytes()), b"fqlib");
     }
 
     #[test]
