@@ -68,20 +68,19 @@ where
 {
     reader
         .lines()
-        .map(|res| res.map(|line| line.into_bytes()))
+        .map(|res| res.map(|line| name_id(line.as_bytes()).into()))
         .collect()
 }
 
-// Names always begin with an `@` character.
-const ID_START_OFFSET: usize = 1;
+fn name_id(mut name: &[u8]) -> &[u8] {
+    name = name.strip_prefix(b"@").unwrap_or(name);
 
-fn name_id(name: &[u8]) -> &[u8] {
     let end = name
         .iter()
         .position(|&b| b == b'/' || b == b' ')
         .unwrap_or(name.len());
 
-    &name[ID_START_OFFSET..end]
+    &name[..end]
 }
 
 pub fn filter(args: FilterArgs) -> Result<(), FilterError> {
@@ -241,9 +240,9 @@ mod tests {
         let names = read_names(data.as_bytes()).unwrap();
 
         assert_eq!(names.len(), 3);
-        assert!(names.contains("@fqlib:1/1".as_bytes()));
-        assert!(names.contains("@fqlib:2/1".as_bytes()));
-        assert!(names.contains("@fqlib:3/1".as_bytes()));
+        assert!(names.contains("fqlib:1".as_bytes()));
+        assert!(names.contains("fqlib:2".as_bytes()));
+        assert!(names.contains("fqlib:3".as_bytes()));
     }
 
     #[test]

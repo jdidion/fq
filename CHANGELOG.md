@@ -14,6 +14,11 @@
 
   * commands/filter: Require source count to match destination count ([#52]).
 
+  * commands/filter: Normalized names input ([#49]).
+
+    The record names to filter now follow the same normalization rules as FASTQ
+    record names, i.e., removal of the `@` prefix and description.
+
   * commands/filter: Require a filter condition.
 
     Previously, both the `names` and `sequence-pattern` options were allowed to
@@ -28,6 +33,7 @@
 
     This also affects how the name is extracted in the `filter` command.
 
+[#49]: https://github.com/stjude-rust-labs/fq/issues/49
 [#51]: https://github.com/stjude-rust-labs/fq/issues/51
 [#52]: https://github.com/stjude-rust-labs/fq/issues/52
 
