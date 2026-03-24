@@ -25,6 +25,13 @@
     be missing, which would passthrough the input. This is a nonsensical
     use-case and can be alternatively achieved with a copy.
 
+  * commands/lint: Re-enable names validator when duplicate name validator is
+    used for paired inputs ([#48]).
+
+    When the inputs are paired, the duplicate name validator (S007) depends on
+    the names validator (P001). If P001 is disabled, it will now get
+    re-enabled.
+
   * fastq/record: Split name from definition on first separator.
 
     This previously searched for the separator from the end of the definition,
@@ -33,6 +40,7 @@
 
     This also affects how the name is extracted in the `filter` command.
 
+[#48]: https://github.com/stjude-rust-labs/fq/issues/48
 [#49]: https://github.com/stjude-rust-labs/fq/issues/49
 [#51]: https://github.com/stjude-rust-labs/fq/issues/51
 [#52]: https://github.com/stjude-rust-labs/fq/issues/52
