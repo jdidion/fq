@@ -179,14 +179,14 @@ where
     info!(record_count = record_counter, "end");
     drop(span_ctx);
 
+    if !use_special_validator {
+        return Ok(failure_count);
+    }
+
     let span = info_span!("validate_pair", pass = 2);
     let _span_ctx = span.enter();
 
     info!("start");
-
-    if !use_special_validator {
-        return Ok(failure_count);
-    }
 
     let mut reader = fastq::fs::open(r1_src).map_err(|e| LintError::OpenFile(e, r1_src.into()))?;
 
