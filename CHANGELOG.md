@@ -12,6 +12,8 @@
     This previously accepted any nonempty string and dropped the rest of the
     characters.
 
+  * commands/filter: Require source count to match destination count ([#52]).
+
   * commands/filter: Require a filter condition.
 
     Previously, both the `names` and `sequence-pattern` options were allowed to
@@ -25,6 +27,7 @@
     times. It now searches from the beginning of the definition.
 
 [#51]: https://github.com/stjude-rust-labs/fq/issues/51
+[#52]: https://github.com/stjude-rust-labs/fq/issues/52
 
 ### Removed
 

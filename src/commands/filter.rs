@@ -88,10 +88,17 @@ fn name_id(name: &[u8]) -> &[u8] {
 }
 
 pub fn filter(args: FilterArgs) -> Result<(), FilterError> {
+    info!(command = "filter", "fq");
+
     let srcs = &args.srcs;
     let dsts = &args.dsts;
 
-    info!(command = "filter", "fq");
+    if srcs.len() != dsts.len() {
+        return Err(FilterError::SourcesDestinationsMismatch(
+            srcs.len(),
+            dsts.len(),
+        ));
+    }
 
     if let Some(names_src) = args.names.as_ref() {
         filter_by_names(srcs, dsts, names_src)?;
@@ -193,6 +200,8 @@ where
 pub enum FilterError {
     #[error("I/O error")]
     Io(#[from] io::Error),
+    #[error("sources-destinations mismatch: expected {0} sources to match {1} destinations")]
+    SourcesDestinationsMismatch(usize, usize),
     #[error("could not open file: {1}")]
     OpenFile(#[source] io::Error, PathBuf),
     #[error("could not create file: {1}")]
