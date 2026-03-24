@@ -57,7 +57,7 @@ pub struct DescribeArgs {
 }
 
 #[derive(Parser)]
-#[command(group(ArgGroup::new("filter").args(["names", "sequence_pattern"])))]
+#[command(group(ArgGroup::new("filter").required(true).args(["names", "sequence_pattern"])))]
 pub struct FilterArgs {
     /// Allowlist of record names.
     #[arg(long)]

@@ -12,6 +12,12 @@
     This previously accepted any nonempty string and dropped the rest of the
     characters.
 
+  * commands/filter: Require a filter condition.
+
+    Previously, both the `names` and `sequence-pattern` options were allowed to
+    be missing, which would passthrough the input. This is a nonsensical
+    use-case and can be alternatively achieved with a copy.
+
   * fastq/record: Split name from definition on first separator.
 
     This previously searched for the separator from the end of the definition,

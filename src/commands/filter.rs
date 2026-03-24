@@ -98,24 +98,10 @@ pub fn filter(args: FilterArgs) -> Result<(), FilterError> {
     } else if let Some(sequence_pattern) = args.sequence_pattern.as_ref() {
         filter_by_sequence_pattern(srcs, dsts, sequence_pattern)?;
     } else {
-        cat(srcs, dsts)?;
+        unreachable!();
     }
 
     info!("done");
-
-    Ok(())
-}
-
-fn cat<P, Q>(srcs: &[P], dsts: &[Q]) -> io::Result<()>
-where
-    P: AsRef<Path>,
-    Q: AsRef<Path>,
-{
-    for (src, dst) in srcs.iter().zip(dsts) {
-        let mut reader = File::open(src)?;
-        let mut writer = File::create(dst)?;
-        io::copy(&mut reader, &mut writer)?;
-    }
 
     Ok(())
 }
