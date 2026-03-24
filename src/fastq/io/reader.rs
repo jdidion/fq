@@ -1,11 +1,12 @@
 use std::io::{self, Read};
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use memchr::memchr_iter;
 
 use crate::fastq::Record;
 
 const DEFAULT_BUF_SIZE: usize = 1024 * 128;
+const LINE_FEED: u8 = b'\n';
 
 pub struct Reader<R> {
     inner: R,
@@ -53,7 +54,6 @@ where
 
 fn decode(buf: &mut BytesMut) -> io::Result<Option<Record>> {
     const LINES_PER_RECORD: usize = 4;
-    const LINE_FEED: u8 = b'\n';
 
     let iter = memchr_iter(LINE_FEED, &buf[..]);
     let mut ends = [0; 4];
@@ -81,7 +81,17 @@ fn decode_eof(buf: &mut BytesMut) -> io::Result<Option<Record>> {
     match decode(buf)? {
         Some(frame) => Ok(Some(frame)),
         None if buf.is_empty() => Ok(None),
-        None => Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+        None => {
+            if !buf.ends_with(&[LINE_FEED]) {
+                buf.put_u8(LINE_FEED);
+            }
+
+            match decode(buf)? {
+                Some(frame) => Ok(Some(frame)),
+                None if buf.is_empty() => Ok(None),
+                None => Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            }
+        }
     }
 }
 
@@ -102,21 +112,18 @@ mod tests {
 
     #[test]
     fn test_read_record() -> io::Result<()> {
-        let data = b"\
-@fqlib:1/1
-ACGT
-+
-FQLB
-";
+        let src = b"@r0/1\nAC\n+\nFQ\n@r1/1\nGT\n+\nLB";
 
-        let mut reader = Reader::new(&data[..]);
+        let mut reader = Reader::new(&src[..]);
         let mut record = Record::default();
 
         reader.read_record(&mut record)?;
-        assert_eq!(record.name(), b"@fqlib:1/1");
-        assert_eq!(record.sequence(), b"ACGT");
-        assert_eq!(record.plus_line(), b"+");
-        assert_eq!(record.quality_scores(), b"FQLB");
+        let expected = Record::new("@r0/1", "AC", "+", "FQ");
+        assert_eq!(record, expected);
+
+        reader.read_record(&mut record)?;
+        let expected = Record::new("@r1/1", "GT", "+", "LB");
+        assert_eq!(record, expected);
 
         assert_eq!(reader.read_record(&mut record)?, 0);
 
