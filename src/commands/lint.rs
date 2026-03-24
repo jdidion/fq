@@ -188,10 +188,37 @@ where
 
     info!("start");
 
-    let mut reader = fastq::fs::open(r1_src).map_err(|e| LintError::OpenFile(e, r1_src.into()))?;
+    let (record_counter, duplicate_name_failure_count) = validate_duplicate_names(
+        r1_src,
+        record_definition_separator,
+        lint_mode,
+        duplicate_name_validator,
+    )?;
+
+    failure_count += duplicate_name_failure_count;
+
+    info!(record_count = record_counter, "end");
+
+    Ok(failure_count)
+}
+
+fn validate_duplicate_names<P>(
+    src: P,
+    record_definition_separator: Option<u8>,
+    lint_mode: LintMode,
+    mut duplicate_name_validator: DuplicateNameValidator,
+) -> Result<(usize, usize), LintError>
+where
+    P: AsRef<Path>,
+{
+    let src = src.as_ref();
+
+    let mut reader = fastq::fs::open(src).map_err(|e| LintError::OpenFile(e, src.into()))?;
 
     let mut record = Record::default();
+
     let mut record_counter = 0;
+    let mut failure_count = 0;
 
     while reader.read_record(&mut record)? != 0 {
         record.reset(record_definition_separator);
@@ -200,15 +227,13 @@ where
             .validate(&record)
             .unwrap_or_else(|e| {
                 failure_count += 1;
-                handle_validation_error(lint_mode, e, r1_src, record_counter);
+                handle_validation_error(lint_mode, e, src, record_counter);
             });
 
         record_counter += 1;
     }
 
-    info!(record_count = record_counter, "end");
-
-    Ok(failure_count)
+    Ok((record_counter, failure_count))
 }
 
 pub fn lint(args: LintArgs) -> Result<(), LintError> {
