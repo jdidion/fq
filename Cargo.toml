@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "fq-tile-subsample"]
+
 [package]
 name = "fq"
 version = "0.12.0"
