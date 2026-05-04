@@ -114,27 +114,30 @@ pub struct LintArgs {
 #[command(group(
     ArgGroup::new("quantity")
         .required(true)
+        .multiple(true)
         .args(["probability", "record_count", "record_count_per_tile"])
 ))]
 pub struct SubsampleArgs {
-    /// The probability a record is kept, as a percentage (0.0, 1.0). Cannot be used with
-    /// `record-count` or `record-count-per-tile`. When combined with `--bin-by-tile`, the
-    /// per-tile count is computed as floor(probability * total_records / num_bins).
-    #[arg(short, long)]
-    pub probability: Option<f64>,
+    /// The probability a record is kept, as a percentage in (0.0, 1.0). May be given more
+    /// than once to emit nested output subsets at each rate (one output pair per value,
+    /// smaller sets are subsets of larger ones). Requires --r1-dst-template when multi-valued.
+    /// Cannot be used with `record-count` or `record-count-per-tile`.
+    #[arg(short, long, num_args = 1..)]
+    pub probability: Vec<f64>,
 
-    /// The exact number of records to keep. Cannot be used with `probability` or
-    /// `record-count-per-tile`. When combined with `--bin-by-tile`, the per-tile count is
-    /// computed as record_count / num_bins.
-    #[arg(short = 'n', long)]
-    pub record_count: Option<u64>,
+    /// The exact number of records to keep. May be given more than once to emit nested
+    /// output subsets at each count. Requires --r1-dst-template when multi-valued.
+    /// Cannot be used with `probability` or `record-count-per-tile`.
+    #[arg(short = 'n', long, num_args = 1..)]
+    pub record_count: Vec<u64>,
 
     /// The exact number of records to keep per tile. Reads are binned by their lane and tile
     /// extracted from the Illumina read header. Bins with fewer than this many records are
     /// discarded, and exactly this many records are randomly sampled from each retained bin.
+    /// May be given more than once (requires --r1-dst-template).
     /// Cannot be used with `probability` or `record-count`.
-    #[arg(long)]
-    pub record_count_per_tile: Option<u64>,
+    #[arg(long, num_args = 1..)]
+    pub record_count_per_tile: Vec<u64>,
 
     /// Enable per-tile binning. Reads are binned by lane and tile from the Illumina read
     /// header. Can be combined with `--record-count` or `--probability` to automatically
@@ -144,7 +147,7 @@ pub struct SubsampleArgs {
 
     /// Use faster skip-ahead sampling instead of the default exact method. Skip-ahead uses
     /// exponential byte jumps and produces approximately (not exactly) the requested number
-    /// of records, but avoids reading the entire file.
+    /// of records, but avoids reading the entire file. Does not support multiple rates.
     #[arg(long)]
     pub fast: bool,
 
@@ -170,13 +173,25 @@ pub struct SubsampleArgs {
     #[arg(short, long)]
     pub seed: Option<u64>,
 
-    /// Read 1 destination. Output will be gzipped if ends in `.gz`.
-    #[arg(long)]
-    pub r1_dst: PathBuf,
+    /// Read 1 destination. Output will be gzipped if ends in `.gz`. For single-rate only;
+    /// use --r1-dst-template for multi-rate output.
+    #[arg(long, conflicts_with = "r1_dst_template")]
+    pub r1_dst: Option<PathBuf>,
 
-    /// Read 2 destination. Output will be gzipped if ends in `.gz`.
-    #[arg(long)]
+    /// Read 2 destination. Output will be gzipped if ends in `.gz`. For single-rate only;
+    /// use --r2-dst-template for multi-rate output.
+    #[arg(long, conflicts_with = "r2_dst_template")]
     pub r2_dst: Option<PathBuf>,
+
+    /// Read 1 destination template. Substitutes `{quantity}` (e.g. p05, n10M, t5000) or
+    /// `{value}` (raw number). Required when a multi-valued quantity flag is given.
+    /// Example: `out/r1_{quantity}.fq.gz` -> `out/r1_p05.fq.gz`, `out/r1_p50.fq.gz`.
+    #[arg(long, conflicts_with = "r1_dst")]
+    pub r1_dst_template: Option<String>,
+
+    /// Read 2 destination template. See --r1-dst-template.
+    #[arg(long, conflicts_with = "r2_dst")]
+    pub r2_dst_template: Option<String>,
 
     /// Read 1 source. Accepts both raw and gzipped FASTQ inputs.
     pub r1_src: PathBuf,

@@ -200,43 +200,79 @@ fn create_output(path: &Path) -> io::Result<Box<dyn Write>> {
     }
 }
 
-/// Sample `target` records from a tile, writing to the output writers.
-/// Uses IndexedReader for precise random access.
-fn sample_tile(
+/// Sample nested index sets from a single tile. `targets` is a slice of bin
+/// sizes the tile is retained at (bin_sizes with tile.record_count >= bin).
+/// The largest set is drawn once, then each smaller set is derived as a
+/// uniform subset of the next larger one, so outputs are nested.
+///
+/// Returns per-target selected indices in the caller's order.
+fn sample_tile_nested(
     tile: &TileFiles,
-    target: usize,
+    targets: &[usize],
     rng: &mut SmallRng,
-    r1_out: &mut dyn Write,
-    r2_out: &mut Option<Box<dyn Write>>,
-) -> Result<usize> {
-    let mut r1_reader = IndexedReader::open(&tile.r1_path)
-        .with_context(|| format!("indexing {}", tile.r1_path.display()))?;
-    let actual = r1_reader.index().record_count();
-    let target = target.min(actual);
+) -> Result<Vec<Vec<usize>>> {
+    let actual = tile.record_count;
+    if actual == 0 || targets.is_empty() {
+        return Ok(targets.iter().map(|_| Vec::new()).collect());
+    }
 
-    if actual == 0 || target == 0 {
-        return Ok(0);
+    let largest_target = targets.iter().copied().max().unwrap_or(0).min(actual);
+    if largest_target == 0 {
+        return Ok(targets.iter().map(|_| Vec::new()).collect());
     }
 
     let dist = Uniform::new(0, actual).unwrap();
     let mut selected = vec![false; actual];
     let mut n = 0;
-    while n < target {
+    while n < largest_target {
         let i = dist.sample(rng);
         if !selected[i] {
             selected[i] = true;
             n += 1;
         }
     }
-
-    let indices: Vec<usize> = selected
+    let largest_indices: Vec<usize> = selected
         .iter()
         .enumerate()
         .filter(|&(_, s)| *s)
         .map(|(i, _)| i)
         .collect();
 
-    r1_reader.read_records_at(&indices, |record| {
+    // Sort targets descending to derive each smaller set from the previous.
+    let mut order: Vec<usize> = (0..targets.len()).collect();
+    order.sort_by_key(|i| std::cmp::Reverse(targets[*i]));
+
+    let mut per_target: Vec<Vec<usize>> = vec![Vec::new(); targets.len()];
+    let mut current = largest_indices;
+    for idx in order {
+        let want = targets[idx].min(current.len());
+        while current.len() > want {
+            let d = Uniform::new(0, current.len()).unwrap();
+            let j = d.sample(rng);
+            current.swap_remove(j);
+        }
+        let mut sorted = current.clone();
+        sorted.sort_unstable();
+        per_target[idx] = sorted;
+    }
+
+    Ok(per_target)
+}
+
+/// Read records at the given indices for the tile and write them to the
+/// provided output writers.
+fn emit_tile_records(
+    tile: &TileFiles,
+    indices: &[usize],
+    r1_out: &mut dyn Write,
+    r2_out: &mut Option<Box<dyn Write>>,
+) -> Result<()> {
+    if indices.is_empty() {
+        return Ok(());
+    }
+    let mut r1_reader = IndexedReader::open(&tile.r1_path)
+        .with_context(|| format!("indexing {}", tile.r1_path.display()))?;
+    r1_reader.read_records_at(indices, |record| {
         r1_out.write_all(record.as_ref())?;
         Ok(())
     })?;
@@ -252,7 +288,7 @@ fn sample_tile(
         })?;
     }
 
-    Ok(target)
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -293,46 +329,76 @@ fn main() -> Result<()> {
     let mut bin_sizes = args.bin_sizes.clone();
     bin_sizes.sort_unstable();
     bin_sizes.dedup();
-    bin_sizes.reverse();
+    // Keep ascending: sample_tile_nested derives smaller sets from larger ones,
+    // but returns results in the order of the caller's `targets` slice.
+    // (manifest entries are emitted in the order used here.)
 
-    let mut manifest: Vec<ManifestEntry> = Vec::new();
-
+    // Prepare one output writer pair per bin size. Kept open for the entire
+    // pass so each tile can fan out into all retained outputs.
+    let mut output_paths: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(bin_sizes.len());
+    let mut r1_writers: Vec<Box<dyn Write>> = Vec::with_capacity(bin_sizes.len());
+    let mut r2_writers: Vec<Option<Box<dyn Write>>> = Vec::with_capacity(bin_sizes.len());
     for &bin_size in &bin_sizes {
-        let bs = bin_size as usize;
         let out_dir = args.outdir.join(format!("B{bin_size}"));
         std::fs::create_dir_all(&out_dir)?;
-
         let r1_dst = out_dir.join(&r1_basename);
         let r2_dst = r2_basename.as_ref().map(|name| out_dir.join(name));
-
-        let mut r1_out = create_output(&r1_dst)?;
-        let mut r2_out: Option<Box<dyn Write>> = r2_dst
+        let r1_w = create_output(&r1_dst)?;
+        let r2_w: Option<Box<dyn Write>> = r2_dst
             .as_ref()
             .map(|dst| create_output(dst))
             .transpose()?;
+        output_paths.push((r1_dst, r2_dst));
+        r1_writers.push(r1_w);
+        r2_writers.push(r2_w);
+    }
 
-        let mut rng = SmallRng::seed_from_u64(args.seed.wrapping_add(bin_size));
+    // One deterministic RNG derived from the caller's seed. We use the same
+    // RNG across all bin sizes because nested sampling shares index draws.
+    let mut rng = SmallRng::seed_from_u64(args.seed);
 
-        let mut records_written = 0usize;
-        let mut tiles_retained = 0usize;
+    let mut records_written_per_bin = vec![0usize; bin_sizes.len()];
+    let mut tiles_retained_per_bin = vec![0usize; bin_sizes.len()];
 
-        for tile in &tiles {
-            if tile.record_count < bs {
-                continue;
-            }
-            tiles_retained += 1;
-
-            let written = sample_tile(tile, bs, &mut rng, &mut *r1_out, &mut r2_out)?;
-            records_written += written;
+    for tile in &tiles {
+        let retained: Vec<(usize, usize)> = bin_sizes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &bs)| tile.record_count >= bs as usize)
+            .map(|(i, &bs)| (i, bs as usize))
+            .collect();
+        if retained.is_empty() {
+            continue;
         }
+        for (i, _) in &retained {
+            tiles_retained_per_bin[*i] += 1;
+        }
+        let targets: Vec<usize> = retained.iter().map(|(_, t)| *t).collect();
+        let per_target_indices = sample_tile_nested(tile, &targets, &mut rng)?;
 
+        for ((bin_idx, _), indices) in retained.iter().zip(per_target_indices.iter()) {
+            records_written_per_bin[*bin_idx] += indices.len();
+            emit_tile_records(
+                tile,
+                indices,
+                &mut *r1_writers[*bin_idx],
+                &mut r2_writers[*bin_idx],
+            )?;
+        }
+    }
+
+    for w in r1_writers.iter_mut() {
+        w.flush()?;
+    }
+    for w in r2_writers.iter_mut().flatten() {
+        w.flush()?;
+    }
+
+    let mut manifest: Vec<ManifestEntry> = Vec::with_capacity(bin_sizes.len());
+    for (i, &bin_size) in bin_sizes.iter().enumerate() {
+        let tiles_retained = tiles_retained_per_bin[i];
         let tiles_discarded = num_tiles - tiles_retained;
-
-        r1_out.flush()?;
-        if let Some(ref mut w) = r2_out {
-            w.flush()?;
-        }
-
+        let records_written = records_written_per_bin[i];
         let pct = if total_records > 0 {
             records_written as f64 / total_records as f64 * 100.0
         } else {
@@ -346,11 +412,11 @@ fn main() -> Result<()> {
             "{:.1}% of input",
             pct
         );
-
+        let (r1_dst, r2_dst) = &output_paths[i];
         manifest.push(ManifestEntry {
             bin_size,
             r1: r1_dst.to_string_lossy().to_string(),
-            r2: r2_dst.map(|p| p.to_string_lossy().to_string()),
+            r2: r2_dst.as_ref().map(|p| p.to_string_lossy().to_string()),
             input_records: total_records,
             input_tiles: num_tiles,
             tiles_retained,
