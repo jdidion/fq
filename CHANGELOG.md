@@ -32,11 +32,48 @@
 
   * Log messages are written to `stderr` rather than `stdout`.
 
+  * cli: `fq lint --record-definition_separator <string>` now only accepts a
+    single ASCII character ([#51]).
+
+    This previously accepted any nonempty string and dropped the rest of the
+    characters.
+
+  * commands/filter: Require source count to match destination count ([#52]).
+
+  * commands/filter: Normalized names input ([#49]).
+
+    The record names to filter now follow the same normalization rules as FASTQ
+    record names, i.e., removal of the `@` prefix and description.
+
+  * commands/filter: Require a filter condition.
+
+    Previously, both the `names` and `sequence-pattern` options were allowed to
+    be missing, which would passthrough the input. This is a nonsensical
+    use-case and can be alternatively achieved with a copy.
+
+  * commands/lint: Re-enable names validator when duplicate name validator is
+    used for paired inputs ([#48]).
+
+    When the inputs are paired, the duplicate name validator (S007) depends on
+    the names validator (P001). If P001 is disabled, it will now get
+    re-enabled.
+
+  * commands/lint: Support the duplicate name validator for single inputs
+    ([#47]).
+
   * fastq/record: Split name from definition on first separator.
 
     This previously searched for the separator from the end of the definition,
     which may contain part of the description if the separator appears multiple
     times. It now searches from the beginning of the definition.
+
+    This also affects how the name is extracted in the `filter` command.
+
+[#47]: https://github.com/stjude-rust-labs/fq/issues/47
+[#48]: https://github.com/stjude-rust-labs/fq/issues/48
+[#49]: https://github.com/stjude-rust-labs/fq/issues/49
+[#51]: https://github.com/stjude-rust-labs/fq/issues/51
+[#52]: https://github.com/stjude-rust-labs/fq/issues/52
 
 ### Removed
 

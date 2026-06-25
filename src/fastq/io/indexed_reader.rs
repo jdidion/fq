@@ -6,6 +6,7 @@ use std::{
 
 use bytes::BytesMut;
 use memchr::memchr_iter;
+use rand::RngExt;
 
 use crate::fastq::Record;
 
@@ -104,7 +105,7 @@ impl<R: Read + Seek> IndexedReader<R> {
     /// Skip-ahead sampling: yield approximately `target` records using
     /// exponential jumps through the index. Since jumps are over record
     /// indices (not byte positions), no boundary detection is needed.
-    pub fn skip_ahead_sample<Rng: rand::Rng>(
+    pub fn skip_ahead_sample<Rng: rand::Rng + RngExt>(
         &mut self,
         target: usize,
         rng: &mut Rng,

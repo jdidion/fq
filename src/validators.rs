@@ -13,7 +13,7 @@ pub use self::{
 
 use std::{error, fmt};
 
-use tracing::info;
+use tracing::{info, warn};
 
 pub type SingleAndPairedValidators = (
     Vec<Box<dyn SingleReadValidator>>,
@@ -83,10 +83,29 @@ pub fn filter_validators(
     paired_read_validation_level: Option<ValidationLevel>,
     disabled_validators: &[String],
 ) -> SingleAndPairedValidators {
+    let mut disabled_validators = disabled_validators.to_vec();
+
+    if paired_read_validation_level.is_some() {
+        let duplicate_name_validator = single::DuplicateNameValidator::new();
+        let code = duplicate_name_validator.code();
+        let use_special_validator = !disabled_validators.contains(&code.to_string());
+
+        let names_validator = paired::NamesValidator;
+        let code = names_validator.code();
+        let names_validator_index = disabled_validators.iter().position(|c| c == code);
+
+        if use_special_validator && let Some(i) = names_validator_index {
+            warn!(
+                "The duplicate name validator (S007) depends on the names validator (P001). P001 will be re-enabled."
+            );
+            disabled_validators.swap_remove(i);
+        }
+    }
+
     info!("disabled validators: {:?}", disabled_validators);
 
     let single_read_validators =
-        filter_single_read_validators(single_read_validation_level, disabled_validators);
+        filter_single_read_validators(single_read_validation_level, &disabled_validators);
 
     let validators: Vec<String> = single_read_validators
         .iter()
@@ -96,7 +115,7 @@ pub fn filter_validators(
     info!("enabled single read validators: {:?}", validators);
 
     let paired_read_validators = paired_read_validation_level
-        .map(|level| filter_paired_read_validators(level, disabled_validators))
+        .map(|level| filter_paired_read_validators(level, &disabled_validators))
         .unwrap_or_default();
 
     let validators: Vec<String> = paired_read_validators
@@ -159,6 +178,24 @@ mod tests {
 
         assert_eq!(single_read_validators.len(), 6);
         assert_eq!(paired_read_validators.len(), 1);
+
+        let (single_read_validators, paired_read_validators) = filter_validators(
+            ValidationLevel::High,
+            Some(ValidationLevel::High),
+            &[String::from("P001")],
+        );
+
+        assert_eq!(single_read_validators.len(), 6);
+        assert_eq!(paired_read_validators.len(), 1);
+
+        let (single_read_validators, paired_read_validators) = filter_validators(
+            ValidationLevel::High,
+            Some(ValidationLevel::High),
+            &[String::from("P001"), String::from("S007")],
+        );
+
+        assert_eq!(single_read_validators.len(), 6);
+        assert_eq!(paired_read_validators.len(), 0);
     }
 
     #[test]

@@ -68,54 +68,43 @@ where
 {
     reader
         .lines()
-        .map(|res| res.map(|line| line.into_bytes()))
+        .map(|res| res.map(|line| name_id(line.as_bytes()).into()))
         .collect()
 }
 
-// Names always begin with an `@` character.
-const ID_START_OFFSET: usize = 1;
+fn name_id(mut name: &[u8]) -> &[u8] {
+    name = name.strip_prefix(b"@").unwrap_or(name);
 
-fn name_id(name: &[u8]) -> &[u8] {
-    let pos = name.iter().rev().position(|&b| b == b'/' || b == b' ');
+    let end = name
+        .iter()
+        .position(|&b| b == b'/' || b == b' ')
+        .unwrap_or(name.len());
 
-    if let Some(i) = pos {
-        let len = name.len();
-        let end = len - i - 1;
-        &name[ID_START_OFFSET..end]
-    } else {
-        &name[ID_START_OFFSET..]
-    }
+    &name[..end]
 }
 
 pub fn filter(args: FilterArgs) -> Result<(), FilterError> {
+    info!(command = "filter", "fq");
+
     let srcs = &args.srcs;
     let dsts = &args.dsts;
 
-    info!(command = "filter", "fq");
+    if srcs.len() != dsts.len() {
+        return Err(FilterError::SourcesDestinationsMismatch(
+            srcs.len(),
+            dsts.len(),
+        ));
+    }
 
     if let Some(names_src) = args.names.as_ref() {
         filter_by_names(srcs, dsts, names_src)?;
     } else if let Some(sequence_pattern) = args.sequence_pattern.as_ref() {
         filter_by_sequence_pattern(srcs, dsts, sequence_pattern)?;
     } else {
-        cat(srcs, dsts)?;
+        unreachable!();
     }
 
     info!("done");
-
-    Ok(())
-}
-
-fn cat<P, Q>(srcs: &[P], dsts: &[Q]) -> io::Result<()>
-where
-    P: AsRef<Path>,
-    Q: AsRef<Path>,
-{
-    for (src, dst) in srcs.iter().zip(dsts) {
-        let mut reader = File::open(src)?;
-        let mut writer = File::create(dst)?;
-        io::copy(&mut reader, &mut writer)?;
-    }
 
     Ok(())
 }
@@ -207,6 +196,8 @@ where
 pub enum FilterError {
     #[error("I/O error")]
     Io(#[from] io::Error),
+    #[error("sources-destinations mismatch: expected {0} sources to match {1} destinations")]
+    SourcesDestinationsMismatch(usize, usize),
     #[error("could not open file: {1}")]
     OpenFile(#[source] io::Error, PathBuf),
     #[error("could not create file: {1}")]
@@ -249,16 +240,16 @@ mod tests {
         let names = read_names(data.as_bytes()).unwrap();
 
         assert_eq!(names.len(), 3);
-        assert!(names.contains("@fqlib:1/1".as_bytes()));
-        assert!(names.contains("@fqlib:2/1".as_bytes()));
-        assert!(names.contains("@fqlib:3/1".as_bytes()));
+        assert!(names.contains("fqlib:1".as_bytes()));
+        assert!(names.contains("fqlib:2".as_bytes()));
+        assert!(names.contains("fqlib:3".as_bytes()));
     }
 
     #[test]
     fn test_name_id() {
-        assert_eq!(name_id("@fqlib:1/1".as_bytes()), b"fqlib:1");
-        assert_eq!(name_id("@fqlib:1 1".as_bytes()), b"fqlib:1");
-        assert_eq!(name_id("@fqlib:1".as_bytes()), b"fqlib:1");
+        assert_eq!(name_id("@fqlib/1".as_bytes()), b"fqlib");
+        assert_eq!(name_id("@fqlib 1".as_bytes()), b"fqlib");
+        assert_eq!(name_id("@fqlib/1 RG:rg0".as_bytes()), b"fqlib");
     }
 
     #[test]

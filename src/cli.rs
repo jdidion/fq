@@ -21,14 +21,12 @@ impl FromStr for AsciiChar {
     type Err = &'static str;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(c) = s.chars().next() {
-            if let Ok(b) = u8::try_from(c) {
-                Ok(Self(b))
-            } else {
-                Err("invalid character found in string")
-            }
+        if let [b] = s.as_bytes()
+            && b.is_ascii()
+        {
+            Ok(Self(*b))
         } else {
-            Err("cannot parse character from empty string")
+            Err("invalid ASCII character")
         }
     }
 }
@@ -59,7 +57,7 @@ pub struct DescribeArgs {
 }
 
 #[derive(Parser)]
-#[command(group(ArgGroup::new("filter").args(["names", "sequence_pattern"])))]
+#[command(group(ArgGroup::new("filter").required(true).args(["names", "sequence_pattern"])))]
 pub struct FilterArgs {
     /// Allowlist of record names.
     #[arg(long)]
@@ -213,4 +211,19 @@ pub struct SubsampleArgs {
 
     /// Read 2 source. Accepts both raw and gzipped FASTQ inputs.
     pub r2_src: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ascii_char_from_str() -> Result<(), &'static str> {
+        assert_eq!("/".parse::<AsciiChar>()?, AsciiChar(b'/'));
+
+        assert!("--".parse::<AsciiChar>().is_err());
+        assert!("🪿".parse::<AsciiChar>().is_err());
+
+        Ok(())
+    }
 }

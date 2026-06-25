@@ -10,7 +10,7 @@ use std::{
 use bitvec::vec::BitVec;
 use flate2::{Compression, bufread::MultiGzDecoder, write::GzEncoder};
 use rand::{
-    SeedableRng,
+    RngExt, SeedableRng,
     distr::{Distribution, Uniform},
     rngs::SmallRng,
 };
@@ -75,7 +75,7 @@ pub fn subsample(args: SubsampleArgs) -> Result<(), SubsampleError> {
                 if sample_idx == 0 {
                     info!("initializing rng from entropy");
                 }
-                SmallRng::from_os_rng()
+                rand::make_rng()
             }
         };
 
