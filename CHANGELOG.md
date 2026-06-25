@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Added
+
+  * commands/subsample: Add `--with-replacement` for bootstrap and oversampling.
+
+    Sampling now supports drawing records *with* replacement, so a record may be
+    emitted more than once. Combined with `-n`/`--record-count` this draws
+    exactly the requested number of records (the output size is independent of
+    the input size); combined with `--fraction` it draws each record's
+    multiplicity from a Poisson distribution. Not supported with `--fast` or
+    tile binning.
+
+  * commands/subsample: Add `--fraction`, replacing `--probability`.
+
+    `--fraction` is a direct replacement for `--probability` (the old name still
+    works as a hidden alias). Without `--with-replacement` it behaves exactly as
+    `--probability` did and must lie in `(0.0, 1.0)`. With `--with-replacement`
+    it may take any value `> 0.0`, and a fraction `> 1.0` oversamples (e.g. `2.0`
+    emits approximately twice the input).
+
+  * commands/subsample: Add `--num-samples` for emitting multiple replicates.
+
+    Emits N independent replicates per requested rate in a single invocation,
+    each from a distinct RNG stream derived from `--seed` (so runs are
+    reproducible). Values `> 1` require `--r1-dst-template`, which may contain a
+    `{sample}` token to disambiguate the outputs.
+
 ### Changed
 
   * Log messages are written to `stderr` rather than `stdout`.

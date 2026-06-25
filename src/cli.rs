@@ -115,19 +115,23 @@ pub struct LintArgs {
     ArgGroup::new("quantity")
         .required(true)
         .multiple(true)
-        .args(["probability", "record_count", "record_count_per_tile"])
+        .args(["fraction", "record_count", "record_count_per_tile"])
 ))]
 pub struct SubsampleArgs {
-    /// The probability a record is kept, as a percentage in (0.0, 1.0). May be given more
-    /// than once to emit nested output subsets at each rate (one output pair per value,
-    /// smaller sets are subsets of larger ones). Requires --r1-dst-template when multi-valued.
+    /// The fraction of records to keep. Without --with-replacement this must lie in (0.0, 1.0)
+    /// and selects each record independently (Bernoulli). With --with-replacement it may be any
+    /// value > 0.0: a fraction > 1.0 oversamples (e.g. 2.0 emits ~2x the input). May be given
+    /// more than once to emit one output per rate (requires --r1-dst-template); without
+    /// replacement the smaller sets are subsets of the larger ones.
     /// Cannot be used with `record-count` or `record-count-per-tile`.
-    #[arg(short, long, num_args = 1..)]
-    pub probability: Vec<f64>,
+    #[arg(short = 'p', long, alias = "probability", num_args = 1..)]
+    pub fraction: Vec<f64>,
 
-    /// The exact number of records to keep. May be given more than once to emit nested
-    /// output subsets at each count. Requires --r1-dst-template when multi-valued.
-    /// Cannot be used with `probability` or `record-count-per-tile`.
+    /// The exact number of records to keep. Without --with-replacement these are drawn without
+    /// replacement (and multiple values emit nested subsets). With --with-replacement each
+    /// requested count is drawn with replacement, so the output has exactly that many records
+    /// regardless of the input size (records may repeat). Requires --r1-dst-template when
+    /// multi-valued. Cannot be used with `fraction` or `record-count-per-tile`.
     #[arg(short = 'n', long, num_args = 1..)]
     pub record_count: Vec<u64>,
 
@@ -140,7 +144,7 @@ pub struct SubsampleArgs {
     pub record_count_per_tile: Vec<u64>,
 
     /// Enable per-tile binning. Reads are binned by lane and tile from the Illumina read
-    /// header. Can be combined with `--record-count` or `--probability` to automatically
+    /// header. Can be combined with `--record-count` or `--fraction` to automatically
     /// compute the per-tile count, or use `--record-count-per-tile` to set it explicitly.
     #[arg(long)]
     pub bin_by_tile: bool,
@@ -150,6 +154,17 @@ pub struct SubsampleArgs {
     /// of records, but avoids reading the entire file. Does not support multiple rates.
     #[arg(long)]
     pub fast: bool,
+
+    /// Sample with replacement (bootstrap). A record may be emitted more than once. Required to
+    /// oversample (a `--fraction` > 1.0). Not supported with --fast or tile binning.
+    #[arg(long)]
+    pub with_replacement: bool,
+
+    /// Number of independent replicates to emit per requested rate. Each replicate uses a
+    /// distinct RNG stream derived from --seed (when given), so runs are reproducible. Values
+    /// > 1 require --r1-dst-template, which may contain `{sample}` to disambiguate the outputs.
+    #[arg(long, default_value_t = 1)]
+    pub num_samples: u32,
 
     /// Keep tile bins in memory instead of writing to temporary files. Uses more memory but
     /// avoids temporary disk I/O. Only used with tile binning.
